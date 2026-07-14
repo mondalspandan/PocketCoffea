@@ -435,9 +435,9 @@ A few caveats worth knowing about:
   into HTCondor with the inline `queue chunksize from ( ... )` form — one
   chunksize per line, embedded directly in `jobs_all.sub` — so a single
   `condor_submit jobs_all.sub` call submits everything regardless of whether
-  the resolved values are uniform or vary across jobs. The per-job `.sub`
-  files are still written and individually carry the right chunksize, so
-  `--recreate-jobs` of an individual job works without any special handling.
+  the resolved values are uniform or vary across jobs. A `resubmit.sub`
+  template and `job_state.json` preserve each job's chunksize and resources
+  for `check-jobs --resubmit`.
 - **Unknown dict keys produce a warning** listing the samples actually
   present in the current fileset, so typos surface immediately.
 
@@ -457,7 +457,14 @@ This is currently implemented for the manual-job executors (`condor@lxplus`,
   unless `local-virtualenv: true` is set.
 - For resubmitting only a subset of jobs (e.g. after failures), see the next section.
 
-### Recreate jobs on manual-job executors
+### Deprecated: recreate jobs on manual-job executors
+
+:::{warning}
+`--recreate-jobs` has been removed. The legacy material below is retained only
+as historical context and must not be used. Resubmit failures with
+`pocket-coffea check-jobs --resubmit`; it preserves the original job artifacts
+and handles queue/resource escalation in place.
+:::
 
 The HTCondor-based manual-job executors (`condor@lxplus`, `condor@rubin`, ...) submit one
 HTCondor job per chunk-group and pickle the per-job `Configurator` to
@@ -641,12 +648,8 @@ Use `Ctrl-C` to detach at any time — the script does not own the jobs, so leav
 just stops monitoring.
 
 :::{note}
-`check-jobs --resubmit` and `pocket-coffea run --recreate-jobs` overlap in
-functionality but are aimed at different workflows: `check-jobs` is a long-running
-"babysitter" that reacts to failures as they happen, while `--recreate-jobs` is a
-one-shot, manual operation you trigger after looking at the state of `jobs_dir/`.
-Pick one or the other for a given run — running both at the same time will produce
-duplicate `condor_submit` calls.
+`check-jobs --resubmit` is the supported failure-recovery path. It is the sole
+component that resubmits manual Condor jobs and updates their queue/resource state.
 :::
 
 ### Merging skim outputs with a skipped input file
@@ -820,5 +823,4 @@ $> pocket-coffea run --cfg analysis_config.py -o output --executor dask  --execu
 When the setup is working fine we would highly appreciate a PR to add the executor to the list of centrally supported
 sites with default options!
 :::
-
 

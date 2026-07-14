@@ -126,15 +126,17 @@ class ExecutorFactoryManualABC(ABC):
 
     def __init__(self, run_options, outputdir, **kwargs):
         self.run_options = run_options
+        if run_options.get("recreate-jobs"):
+            raise RuntimeError(
+                "--recreate-jobs has been removed; use check-jobs --resubmit instead."
+            )
         self.job_name = run_options.get("job-name", "job")
         self.jobs_dir = os.path.join(run_options.get("jobs-dir", outputdir), self.job_name)
-        recreate_jobs = run_options.get("recreate-jobs", None)
-        if not recreate_jobs:
-            if  os.path.exists(self.jobs_dir):
-                print(f"Jobs directory {self.jobs_dir} already exists. Please clean it up before running the jobs.")
-                exit(1)
-            else:
-                os.makedirs(self.jobs_dir)
+        if os.path.exists(self.jobs_dir):
+            print(f"Jobs directory {self.jobs_dir} already exists. Please clean it up before running the jobs.")
+            exit(1)
+        else:
+            os.makedirs(self.jobs_dir)
         self.setup()
         # If handles_submission == True, the executor is responsible for submitting the job
         self.handles_submission = True
@@ -182,17 +184,12 @@ class ExecutorFactoryManualABC(ABC):
         self.config = config
         self.outputdir = outputdir
         self.filesets = filesets
-        if jobs_to_recreate:=self.run_options.get("recreate-jobs", None):
-            # Don't run the splitting but read the jobs config, recreate the configurator
-            # and submit the jobs
-            self.recreate_jobs(jobs_to_recreate)
-        else:
-            splits = self.prepare_splitting(filesets)
-            # Save the per-job splits so submit_jobs can resolve per-job options
-            # (per-sample chunksize, etc.) without re-reading jobs_config.yaml.
-            self._splits = splits
-            job_configs = self.prepare_jobs(splits)
-            self.submit_jobs(job_configs)
+        splits = self.prepare_splitting(filesets)
+        # Save the per-job splits so submit_jobs can resolve per-job options
+        # (per-sample chunksize, etc.) without re-reading jobs_config.yaml.
+        self._splits = splits
+        job_configs = self.prepare_jobs(splits)
+        self.submit_jobs(job_configs)
 
     def prepare_splitting(self, filesets):
         '''Looking at the run options the fileset can be split in different ways.

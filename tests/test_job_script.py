@@ -58,6 +58,14 @@ def test_flag_files_use_jobid_not_positional_one():
     assert "job_$1." not in script
 
 
+def test_timeout_and_xrootd_recovery_are_in_the_wrapper():
+    script = _script()
+    assert "trap cleanup TERM INT" in script
+    assert "job_$JOBID.timeout" in script
+    assert "MAX_XROOTD_REWRITES=10" in script
+    assert "python -m pocket_coffea.scripts.rewrite_xrootd_site" in script
+
+
 def test_non_split_copies_from_job_local_output():
     script = _script(split_by_category=False)
     assert "output/output_all.coffea /abs/out/output_job_$JOBID.coffea" in script

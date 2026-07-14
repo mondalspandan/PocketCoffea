@@ -29,8 +29,9 @@ from pocket_coffea.utils.benchmarking import print_processing_stats
               help='Config file with parameters specific to the current run')
 @click.option("-ro", "--custom-run-options", type=str, default=None, help="User provided run options .yaml file")
 @click.option("-o", "--outputdir", required=True, type=str, help="Output folder")
-@click.option("-t", "--test", is_flag=True, help="Run with limit 1 interactively")
+@click.option("-t", "--test", is_flag=True, help="Run with small defaults interactively")
 @click.option("-lf","--limit-files", type=int, help="Limit number of files")
+@click.option("-ls","--limit-samples", type=int, help="Limit number of samples/datasets")
 @click.option("-lc","--limit-chunks", type=int, help="Limit number of chunks", default=None)
 @click.option("-e","--executor", type=str, help="Overwrite executor from config (to be used only with the --test options)", default="iterative")
 @click.option("-s","--scaleout", type=int, help="Overwrite scaleout config" )
@@ -44,19 +45,11 @@ from pocket_coffea.utils.benchmarking import print_processing_stats
 @click.option("--filter-datasets", type=str, help="Filter the datasets to be processed (comma separated list)")
 @click.option("--resubmit-failed", is_flag=True, help="Resubmit only failed jobs from previous run (requires failed_jobs.json)", default=False)
 @click.option("--blocklist-sites", type=str, default=None,
-              help="Comma-separated CMS site names to avoid when using --recreate-jobs on a manual-jobs executor. "
-                   "Files currently served by a blocklisted site are rewritten via DAS lookup, falling back to the "
-                   "global xrootd redirector if no alternative is available.")
+              help="Deprecated together with --recreate-jobs; use check-jobs --resubmit for failed Condor jobs.")
 @click.option("--recreate-queue", type=str, default=None,
-              help="When used together with --recreate-jobs on a manual-jobs executor, "
-                   "rewrite each resubmitted job's +JobFlavour to this HTCondor queue "
-                   "(e.g. espresso, microcentury, longlunch, workday, tomorrow, testmatch, nextweek). "
-                   "Overrides the implicit timeout-bump for running jobs.")
+              help="Deprecated together with --recreate-jobs; check-jobs controls queue escalation.")
 @click.option("--use-redirector", is_flag=True, default=False,
-              help="When used together with --recreate-jobs on a manual-jobs executor, "
-                   "rewrite every file in every resubmitted job to use the global xrootd "
-                   "redirector (root://xrootd-cms.infn.it//), skipping per-site Rucio lookups. "
-                   "Useful when many sites are flaky and you want xrootd to figure out routing.")
+              help="Deprecated together with --recreate-jobs; XRootD recovery is handled in job.sh.")
 @click.option("--skip-bad-files", is_flag=True, default=False,
               help="Tell Coffea's Runner to skip files that fail to open (xrootd timeout, "
                    "missing file, corrupted ROOT header) instead of aborting the run. "
@@ -65,7 +58,7 @@ from pocket_coffea.utils.benchmarking import print_processing_stats
                    "--recreate-jobs, also idempotently patches an existing jobs_dir so the "
                    "flag is honoured by the inner pocket-coffea call.")
 
-def run(cfg,  custom_run_options, outputdir, test, limit_files,
+def run(cfg,  custom_run_options, outputdir, test, limit_files, limit_samples,
            limit_chunks, executor, scaleout, chunksize,
            queue, loglevel, process_separately, executor_custom_setup,
            filter_years, filter_samples, filter_datasets, resubmit_failed,
@@ -130,6 +123,9 @@ def run(cfg,  custom_run_options, outputdir, test, limit_files,
         run_options["limit-files"] = limit_files
         config.filter_dataset(run_options["limit-files"])
 
+    if limit_samples!=None:
+        run_options["limit-samples"] = limit_samples
+
     if limit_chunks!=None:
         run_options["limit-chunks"] = limit_chunks
 
@@ -168,11 +164,18 @@ def run(cfg,  custom_run_options, outputdir, test, limit_files,
                 else:
                     run_options[arg[2:]] = True
 
+    if run_options.get("recreate-jobs"):
+        raise click.UsageError(
+            "--recreate-jobs has been removed. Use `check-jobs --resubmit` to "
+            "resubmit failed Condor jobs."
+        )
 
-    ## Default config for testing: iterative executor, with 2 file and 2 chunks
+
+    ## Default config for testing: iterative executor, with 2 files, 2 samples, and 2 chunks
     if test:
         executor = executor if executor else "iterative"
         run_options["limit-files"] = limit_files if limit_files else 2
+        run_options["limit-samples"] = limit_samples if limit_samples else 2
         run_options["limit-chunks"] = limit_chunks if limit_chunks else 2
         config.filter_dataset(run_options["limit-files"])
 
@@ -251,6 +254,8 @@ def run(cfg,  custom_run_options, outputdir, test, limit_files,
         filesets_to_run = {dataset: files for dataset, files in filesets_to_run.items() if files["metadata"]["sample"] in filter_samples}
     if filter_datasets:
         filesets_to_run = {dataset: files for dataset, files in filesets_to_run.items() if dataset in filter_datasets}
+    if run_options.get("limit-samples") is not None:
+        filesets_to_run = dict(list(filesets_to_run.items())[:run_options["limit-samples"]])
 
     # Handle resubmission of failed jobs
     if resubmit_failed:
