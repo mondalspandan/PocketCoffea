@@ -126,10 +126,6 @@ class ExecutorFactoryManualABC(ABC):
 
     def __init__(self, run_options, outputdir, **kwargs):
         self.run_options = run_options
-        if run_options.get("recreate-jobs"):
-            raise RuntimeError(
-                "--recreate-jobs has been removed; use check-jobs --resubmit instead."
-            )
         self.job_name = run_options.get("job-name", "job")
         self.jobs_dir = os.path.join(run_options.get("jobs-dir", outputdir), self.job_name)
         if os.path.exists(self.jobs_dir):

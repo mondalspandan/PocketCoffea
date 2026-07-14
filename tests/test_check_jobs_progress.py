@@ -363,100 +363,17 @@ def test_latest_job_out_uses_out_logs(tmp_path):
     assert latest_job_out(tmp_path, "job_0") == str(new)
 
 
-def test_recreate_jobs_generates_sub_files_on_the_fly(tmp_path, monkeypatch):
-    from pocket_coffea.executors.executors_lxplus import ExecutorFactoryCondorCERN
+def test_recreate_queue_synchronizes_dynamic_state(tmp_path):
+    from pocket_coffea.scripts.check_jobs import sync_dynamic_queue
 
-    with pytest.raises(RuntimeError, match="recreate-jobs has been removed"):
-        ExecutorFactoryCondorCERN({"recreate-jobs": "auto"}, str(tmp_path))
-    return
+    state_file = tmp_path / "job_state.json"
+    state_file.write_text(json.dumps({"0": {"queue": "espresso"}}))
 
-    import yaml as pyyaml
+    assert sync_dynamic_queue(tmp_path, "job_0", "workday")
+    assert json.loads(state_file.read_text())["0"]["queue"] == "workday"
 
-    # 1. Create a dummy jobs directory structure
-    jobs_dir = tmp_path / "job"
-    jobs_dir.mkdir()
-    (jobs_dir / "logs").mkdir()
 
-    # Write resubmit.sub template
-    resubmit_sub = (
-        "Executable = job.sh\n"
-        "Error = logs/job_$(ClusterId).$(PROC).out\n"
-        "Output = logs/job_$(ClusterId).$(PROC).out\n"
-        "Log = logs/job_$(ClusterId).$(PROC).log\n"
-        "+JobFlavour = \"$(QUEUE)\"\n"
-        "RequestCpus = $(CPUS)\n"
-        "RequestMemory = $(MEMORY)\n"
-        "arguments = $(PROC) config_job_$(PROC).pkl $(CHUNKSIZE) $(CPUS)\n"
-        "transfer_input_files = config_job_$(PROC).pkl,job.sh\n"
-    )
-    (jobs_dir / "resubmit.sub").write_text(resubmit_sub)
+def test_recreate_queue_sync_is_legacy_safe(tmp_path):
+    from pocket_coffea.scripts.check_jobs import sync_dynamic_queue
 
-    # Write job_state.json
-    job_state = {
-        "0": {
-            "queue": "espresso",
-            "chunksize": 100,
-            "request_cpus": 2,
-            "request_memory": "4GB",
-        }
-    }
-    (jobs_dir / "job_state.json").write_text(json.dumps(job_state))
-
-    # Write jobs_config.yaml
-    jobs_config = {
-        "jobs_list": {
-            "job_0": {
-                "filesets": {"sampleA": {"files": ["file1.root"], "metadata": {"nevents": 100}}},
-            }
-        }
-    }
-    (jobs_dir / "jobs_config.yaml").write_text(pyyaml.dump(jobs_config))
-
-    # Write a dummy config pkl to satisfy cloudpickle load
-    import cloudpickle
-    class FakeConfigurator:
-        def __init__(self):
-            self.filesets = {}
-        def set_filesets_manually(self, filesets):
-            self.filesets = filesets
-    cloudpickle.dump(FakeConfigurator(), open(jobs_dir / "config_job_0.pkl", "wb"))
-
-    # Mock/stub run options and executor factory
-    run_options = {
-        "job-name": "job",
-        "jobs-dir": str(tmp_path),
-        "ignore-grid-certificate": True,
-        "dry-run": False,
-        "queue": "espresso",
-        "cores-per-worker": 1,
-        "mem-per-worker": "4GB",
-        "recreate-jobs": "auto",
-    }
-
-    # Avoid actually calling condor_submit, just record the commands
-    submitted_commands = []
-    monkeypatch.setattr(os, "system", lambda cmd: submitted_commands.append(cmd) or 0)
-    monkeypatch.setattr(ExecutorFactoryCondorCERN, "setup_proxyfile", lambda self: None)
-
-    # Instantiate the factory and run recreate_jobs
-    factory = ExecutorFactoryCondorCERN(run_options, str(tmp_path))
-    # Touch a .failed file to mimic auto detection
-    (jobs_dir / "job_0.failed").write_text("")
-
-    factory.recreate_jobs("auto")
-
-    # 2. Assertions
-    generated_sub = jobs_dir / "job_0.sub"
-    assert generated_sub.exists()
-    sub_text = generated_sub.read_text()
-    assert "Executable = job.sh" in sub_text
-    assert "+JobFlavour = \"espresso\"" in sub_text
-    assert "RequestCpus = 2" in sub_text
-    assert "RequestMemory = 4GB" in sub_text
-    assert "arguments = 0 config_job_0.pkl 100 2" in sub_text
-    assert "queue" in sub_text
-
-    # Verify that the delete failed / touch idle / condor_submit sequence was executed
-    assert any("rm" in cmd and "job_0.failed" in cmd for cmd in submitted_commands)
-    assert any("touch" in cmd and "job_0.idle" in cmd for cmd in submitted_commands)
-    assert any("condor_submit job_0.sub" in cmd for cmd in submitted_commands)
+    assert not sync_dynamic_queue(tmp_path, "job_0", "workday")

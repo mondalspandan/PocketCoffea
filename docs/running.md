@@ -438,7 +438,10 @@ A few caveats worth knowing about:
   the resolved values are uniform or vary across jobs. The per-job `.sub`
   files are still written and individually carry the right chunksize, so
   recreating an individual job with `check-jobs --recreate` works without any
-  special handling.
+  special handling. New lxplus job directories also contain `resubmit.sub`
+  and `job_state.json`: the latter preserves each job's chunksize and current
+  resource request so reactive `check-jobs --resubmit` can submit all failures
+  from a polling step as one dynamic Condor batch.
 - **Unknown dict keys produce a warning** listing the samples actually
   present in the current fileset, so typos surface immediately.
 
@@ -585,27 +588,17 @@ queue bumping is a no-op there.
 
 #### What `--resubmit` actually does
 
-For every job whose flag file is `.failed`, `check-jobs` inspects
-`jobs_dir/logs/job_*.{id}.out` and reacts to the failure mode it finds:
+For every job whose flag file is `.failed`, `check-jobs` inspects its latest `.out` log.
+The wrapper already retries XRootD failures against alternate sites before exposing a
+failure. A timeout creates a `.timeout` marker; the monitor converts it to `.failed`,
+bumps the job's `+JobFlavour`, and scales its CPU/memory request once. Ordinary repeat
+failures are also escalated after their first resubmission.
 
-- **XRootD read failure** (`OSError: XRootD error` or `FileNotFoundError: file not found`):
-  the offending file URL is recorded in `jobs_dir/xrootdfaillist.txt`, the failed file
-  is rewritten via a Rucio replica lookup to a non-failed, non-blacklisted replica
-  (`find_other_file` inside the script), and the per-job pickle
-  `config_job_{i}.pkl` is updated in place. The original log is moved under
-  `jobs_dir/logs/processedlogs/` so the same failure is not counted twice.
-- **Recurring failures from the same site**: once a site has produced more than
-  `--blacklist-threshold` failed reads, it is added to an in-memory blacklist (unioned
-  with any explicit `--blocklist-sites`) and *every* file in the failed job's config
-  that lives at a blacklisted site is proactively migrated, not just the one that failed.
-- **HTCondor max-time abort** (`SYSTEM_PERIODIC_REMOVE` in the `.log` file): the job's
-  `.sub` file is rewritten with the next `+JobFlavour` queue (per `--queue-shift`, or
-  forced to `--recreate-queue` if set), the job is marked failed, and the next poll picks
-  it up for resubmission. The cluster/proc-id is remembered in `jobs_dir/maxtime.txt` so
-  the same abort is not bumped again.
-
-After patching, the script issues `condor_submit job_{i}.sub`, removes the `.failed`
-flag, and touches `.idle`.
+For newly created lxplus directories, the monitor writes one `resubmit_now.sub` from
+`resubmit.sub` and `job_state.json`, containing every failed job in that polling pass,
+then submits that single batch. The marker files are changed to `.idle` only after the
+batch submission succeeds. Existing directories without dynamic state remain supported:
+they use their individual `job_{i}.sub` files.
 
 The tool exits automatically when `done + failed == total`, and prints the suggested
 next command:
@@ -619,11 +612,11 @@ Use `Ctrl-C` to detach at any time — the script does not own the jobs, so leav
 just stops monitoring.
 
 :::{note}
-The babysitter loop (`--resubmit`) rewrites `config_job_{i}.pkl` incrementally as it
-reacts to one failed file at a time, whereas the one-shot `--recreate` pass re-derives
-each fileset from scratch out of `jobs_config.yaml`. Both are safe on the same jobs_dir,
-but avoid running two `check-jobs --resubmit`/`--recreate` processes against the same
-directory at once — they would issue duplicate `condor_submit` calls.
+The one-shot `--recreate` pass re-derives each fileset from scratch out of
+`jobs_config.yaml` and uses the individual `.sub` files; the reactive babysitter uses
+the dynamic state for new directories. Avoid running two `check-jobs --resubmit` or
+`--recreate` processes against the same directory at once — they would issue duplicate
+`condor_submit` calls.
 :::
 
 ### Merging skim outputs with a skipped input file
@@ -797,5 +790,4 @@ $> pocket-coffea run --cfg analysis_config.py -o output --executor dask  --execu
 When the setup is working fine we would highly appreciate a PR to add the executor to the list of centrally supported
 sites with default options!
 :::
-
 

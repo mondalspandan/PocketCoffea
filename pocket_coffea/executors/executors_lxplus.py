@@ -14,7 +14,75 @@ from pocket_coffea.utils.configurator import Configurator
 import pocket_coffea
 import cloudpickle
 import yaml
-from rich.progress import Progress
+import json
+import multiprocessing as mp
+from rich.console import Console
+from rich.progress import (
+    BarColumn,
+    Progress,
+    SpinnerColumn,
+    TextColumn,
+    TimeElapsedColumn,
+    TimeRemainingColumn,
+)
+
+_PREPARE_CFG = None
+_PREPARE_JOBS_DIR = None
+_PREPARE_OUTPUTDIR = None
+
+
+def _prepare_job_config_worker(config, split, i, jobs_dir, outputdir):
+    partial_config = config.clone()
+    partial_config.set_filesets_manually(split)
+    outputfile = f"{os.path.abspath(outputdir)}/output_job_{i}.coffea"
+    config_file = f"{jobs_dir}/config_job_{i}.pkl"
+    with open(config_file, "wb") as f:
+        cloudpickle.dump(partial_config, f)
+    return i, config_file, split, outputfile
+
+def _prepare_job_config_init(config, jobs_dir, outputdir):
+    global _PREPARE_CFG, _PREPARE_JOBS_DIR, _PREPARE_OUTPUTDIR
+    _PREPARE_CFG = config
+    _PREPARE_JOBS_DIR = jobs_dir
+    _PREPARE_OUTPUTDIR = outputdir
+
+def _prepare_job_config_worker_indexed(item):
+    i, split = item
+    return _prepare_job_config_worker(_PREPARE_CFG, split, i, _PREPARE_JOBS_DIR, _PREPARE_OUTPUTDIR)
+
+
+CONDOR_GRACEFUL_SHUTDOWN_SECONDS = 5 * 60
+
+
+def build_condor_shutdown_policy():
+    """Return the submit attributes used for the five-minute timeout warning."""
+    return {
+        "periodic_remove": (
+            "(JobStatus == 2) && (JobCurrentStartDate =!= UNDEFINED) && "
+            f"((time() - JobCurrentStartDate) > "
+            f"(MaxRuntime - {CONDOR_GRACEFUL_SHUTDOWN_SECONDS}))"
+        ),
+        "want_graceful_removal": True,
+        "job_max_vacate_time": CONDOR_GRACEFUL_SHUTDOWN_SECONDS,
+        "kill_sig": 15,
+    }
+
+
+def build_condor_job_state(per_job_chunksize, queue, cpus, memory):
+    return {
+        str(i): {
+            "queue": queue,
+            "chunksize": chunksize,
+            "base_cpus": cpus,
+            "base_memory": memory,
+            "request_cpus": cpus,
+            "request_memory": memory,
+            "resources_scaled": False,
+            "resubmissions": 0,
+        }
+        for i, chunksize in enumerate(per_job_chunksize)
+    }
+
 
 def get_worker_env(run_options,x509_path,exec_name="dask"):
     env_worker = [
@@ -178,15 +246,41 @@ def build_job_script(
 
 JOBDIR={abs_jobdir_path}
 JOBID="$1"
+MAX_XROOTD_REWRITES=10
+cleanup_started=0
+
+cleanup() {{
+    trap - TERM INT
+    if [ "$cleanup_started" -eq 1 ]; then
+        return
+    fi
+    cleanup_started=1
+    echo "Termination signal received."
+    rm -f "$JOBDIR/job_$JOBID.running" "$JOBDIR/job_$JOBID.idle"
+    touch "$JOBDIR/job_$JOBID.timeout"
+    echo "Marked job as timeout."
+    if [[ -n "${{child:-}}" ]]; then
+        kill -TERM "$child" 2>/dev/null || true
+        wait "$child" 2>/dev/null || true
+    fi
+    exit 0
+}}
+
+trap cleanup TERM INT
 
 run_with_retries() {{
     local cmd="$*"
     for i in {{1..10}}; do
-        eval "$cmd" && return 0
+        eval "$cmd" &
+        child=$!
+        wait "$child"
+        command_status=$?
+        child=""
+        [ $command_status -eq 0 ] && return 0
         sleep 10
     done
     echo "$cmd failed after 10 attempts."
-    rm $JOBDIR/job_$JOBID.running
+    rm -f $JOBDIR/job_$JOBID.running
     touch $JOBDIR/job_$JOBID.failed
     exit 1
 }}
@@ -196,9 +290,40 @@ rm -f $JOBDIR/job_$JOBID.idle
 echo "Starting job $JOBID"
 touch $JOBDIR/job_$JOBID.running
 
-{runnercmd} --cfg $2 -o output EXECUTOR --chunksize $3 --custom-run-options {inner_yaml_basename}
-# Do things only if the job is successful
-if [ $? -eq 0 ]; then
+attempt=0
+job_succeeded=0
+failed_xrootd_sites="$_CONDOR_SCRATCH_DIR/failed_xrootd_sites.txt"
+while true; do
+    attempt_log="$_CONDOR_SCRATCH_DIR/job_attempt_${{attempt}}.out"
+    echo "Runner attempt $attempt"
+    {runnercmd} --cfg $2 -o output EXECUTOR --chunksize $3 --custom-run-options {inner_yaml_basename} > "$attempt_log" 2>&1 &
+    child=$!
+    wait "$child"
+    runner_status=$?
+    child=""
+    cat "$attempt_log"
+    if [ $runner_status -eq 0 ]; then
+        job_succeeded=1
+        break
+    fi
+    if [ $attempt -ge $MAX_XROOTD_REWRITES ]; then
+        echo "Reached the maximum number of XRootD recovery attempts ($MAX_XROOTD_REWRITES)."
+        break
+    fi
+    python -m pocket_coffea.scripts.rewrite_xrootd_site --config "$2" --log "$attempt_log" --failed-sites-file "$failed_xrootd_sites" &
+    child=$!
+    wait "$child"
+    rewrite_status=$?
+    child=""
+    if [ $rewrite_status -eq 0 ]; then
+        echo "XRootD site rewrite changed the config. Rerunning job $JOBID."
+        attempt=$((attempt + 1))
+        continue
+    fi
+    break
+done
+
+if [ $job_succeeded -eq 1 ]; then
     echo 'Job successful'
     {splitcommands}
     rm $JOBDIR/job_$JOBID.running
@@ -234,25 +359,42 @@ class ExecutorFactoryCondorCERN(ExecutorFactoryManualABC):
         }
         # Disabling the postprocessing
         self.config.do_postprocessing = False
-        # Splitting the filets creating a new configuration for each and pickling it
-        with Progress() as progress:
-            task1 = progress.add_task("[cyan]Preparing config pkls...", total=len(splits))
-            for i, split in enumerate(splits):
-                # We want to create an unloaded copy of the configurator, and setting the filtered
-                # fileset
-                partial_config = self.config.clone()
-                # take the config filr, set the fileset and save it.
-                partial_config.set_filesets_manually(split)
-                cloudpickle.dump(partial_config, open(f"{self.jobs_dir}/config_job_{i}.pkl", "wb"))
-                config_files.append(f"{self.jobs_dir}/config_job_{i}.pkl")
-                jobs_config["jobs_list"][f"job_{i}"] = {
-                    "filesets": split,
-                    "config_file": f"{self.jobs_dir}/config_job_{i}.pkl",
-                    "output_file": f"{os.path.abspath(self.outputdir)}/output_job_{i}.coffea",
-                }
+        # Splitting the filesets, creating a new configuration for each and pickling it.
+        # Parallelised with multiprocessing.Pool to speed up large submission batches.
+        total_splits = len(splits)
+        config_files = [None] * total_splits
+        console = Console(stderr=True)
+        progress = Progress(
+            SpinnerColumn(),
+            TextColumn("[cyan]Preparing config pkls"),
+            BarColumn(),
+            TextColumn("{task.completed}/{task.total}"),
+            TimeElapsedColumn(),
+            TimeRemainingColumn(),
+            console=console,
+            refresh_per_second=10,
+            transient=False,
+        )
+        work_items = [(i, split) for i, split in enumerate(splits)]
+        with progress:
+            task1 = progress.add_task("prepare_pkls", total=total_splits)
+            ctx = mp.get_context("fork")
+            with ctx.Pool(
+                processes=8,
+                initializer=_prepare_job_config_init,
+                initargs=(self.config, self.jobs_dir, self.outputdir),
+            ) as pool:
+                for i, config_file, split, output_file in pool.imap_unordered(
+                    _prepare_job_config_worker_indexed, work_items, chunksize=1
+                ):
+                    config_files[i] = config_file
+                    jobs_config["jobs_list"][f"job_{i}"] = {
+                        "filesets": split,
+                        "config_file": config_file,
+                        "output_file": output_file,
+                    }
+                    progress.update(task1, advance=1)
 
-                progress.update(task1, advance=1)
-            
         yaml.dump(jobs_config, open(f"{self.jobs_dir}/jobs_config.yaml", "w"))
         # save the configuration
         return config_files
@@ -315,7 +457,6 @@ class ExecutorFactoryCondorCERN(ExecutorFactoryManualABC):
             split_by_category=self.run_options["split-by-category"],
             cores_per_worker=self.run_options["cores-per-worker"],
         )
-
         with open(f"{self.jobs_dir}/job.sh", "w") as f:
             f.write(script)
 
@@ -333,7 +474,7 @@ class ExecutorFactoryCondorCERN(ExecutorFactoryManualABC):
         # Writing the jid file as the htcondor python submission does not work in the singularity
         sub = {
             'Executable': "job.sh",
-            'Error': f"{abs_jobdir_path}/logs/job_$(ClusterId).$(ProcId).err",
+            'Error': f"{abs_jobdir_path}/logs/job_$(ClusterId).$(ProcId).out",
             'Output': f"{abs_jobdir_path}/logs/job_$(ClusterId).$(ProcId).out",
             'Log': f"{abs_jobdir_path}/logs/job_$(ClusterId).log",
             'MY.SendCredential': True,
@@ -341,14 +482,16 @@ class ExecutorFactoryCondorCERN(ExecutorFactoryManualABC):
             '+JobFlavour': f'"{self.run_options["queue"]}"',
             'RequestCpus' : self.run_options['cores-per-worker'],
             'RequestMemory' : f"{self.run_options['mem-per-worker']}",
-            'arguments': f"$(ProcId) config_job_$(ProcId).pkl $(chunksize)",
+            'arguments': f"$(ProcId) config_job_$(ProcId).pkl $(chunksize) {self.run_options['cores-per-worker']}",
             'should_transfer_files':'YES',
             'when_to_transfer_output' : 'ON_EXIT',
+            'transfer_output_files' : '',
             'transfer_input_files' : f"{abs_jobdir_path}/config_job_$(ProcId).pkl,{self.x509_path},{abs_jobdir_path}/job.sh,{abs_jobdir_path}/{inner_yaml_basename}",
             'on_exit_remove': '(ExitBySignal == False) && (ExitCode == 0)',
             'max_retries' : self.run_options["retries"],
             'requirements' : 'Machine =!= LastRemoteHost'
         }
+        sub.update(build_condor_shutdown_policy())
 
         # HTCondor inline `queue <var> from ( ... )` form: one job per item, with
         # the per-job value made available as $(chunksize) in the arguments line.
@@ -361,18 +504,47 @@ class ExecutorFactoryCondorCERN(ExecutorFactoryManualABC):
             for cs in per_job_chunksize:
                 f.write(f"  {cs}\n")
             f.write(")\n")
-        # Creating also single sub files for resubmission. These hard-code their
-        # own chunksize since they will be submitted with plain `queue`.
-        print(f"Creating {len(jobs_config)} .sub files for individual job submission.")
+
+        job_state = build_condor_job_state(
+            per_job_chunksize,
+            self.run_options["queue"],
+            self.run_options["cores-per-worker"],
+            self.run_options["mem-per-worker"],
+        )
+        with open(f"{self.jobs_dir}/job_state.json", "w") as f:
+            json.dump(job_state, f, indent=2, sort_keys=True)
+
+        # check-jobs appends one queue row per failed job to this template.
+        resubmit_sub = dict(sub)
+        resubmit_sub.update({
+            "Error": f"{abs_jobdir_path}/logs/job_$(ClusterId).$(PROC).out",
+            "Output": f"{abs_jobdir_path}/logs/job_$(ClusterId).$(PROC).out",
+            "Log": f"{abs_jobdir_path}/logs/job_$(ClusterId).$(PROC).log",
+            "+JobFlavour": '"$(QUEUE)"',
+            "RequestCpus": "$(CPUS)",
+            "RequestMemory": "$(MEMORY)",
+            "arguments": "$(PROC) config_job_$(PROC).pkl $(CHUNKSIZE) $(CPUS)",
+            "transfer_input_files": (
+                f"{abs_jobdir_path}/config_job_$(PROC).pkl,{self.x509_path},"
+                f"{abs_jobdir_path}/job.sh,{abs_jobdir_path}/{inner_yaml_basename}"
+            ),
+        })
+        with open(f"{self.jobs_dir}/resubmit.sub", "w") as f:
+            for k, v in resubmit_sub.items():
+                f.write(f"{k} = {v}\n")
+
+        # Keep one concrete submit file per job for check-jobs --recreate and
+        # for compatibility with job directories created before dynamic batching.
+        print(f"Creating {len(jobs_config)} .sub files for proactive recreation.")
         for i, _ in enumerate(jobs_config):
             with open(f"{self.jobs_dir}/job_{i}.sub", "w") as f:
-                for k,v in sub.items():
-                    if isinstance(v, str):
-                        v = v.replace("$(ProcId)", str(i))
-                        v = v.replace("$(ClusterId).log", f"$(ClusterId).{i}.log")
-                        v = v.replace("$(chunksize)", str(per_job_chunksize[i]))
-                    f.write(f"{k} = {v}\n")
-                f.write(f"queue\n")
+                for key, value in sub.items():
+                    if isinstance(value, str):
+                        value = value.replace("$(ProcId)", str(i))
+                        value = value.replace("$(ClusterId).log", f"$(ClusterId).{i}.log")
+                        value = value.replace("$(chunksize)", str(per_job_chunksize[i]))
+                    f.write(f"{key} = {value}\n")
+                f.write("queue\n")
             # Let's also create a .idle file to indicate the the job is in idle
             with open(f"{self.jobs_dir}/job_{i}.idle", "w") as f:
                 f.write("")
