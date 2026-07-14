@@ -64,9 +64,9 @@ def ensure_job_sh_forwards_inner_yaml(job_sh_path,
     invoked with `--custom-run-options inner_run_options.yaml`.
 
     No-op when the wrapper already references the YAML. Used by
-    `--recreate-jobs` so an existing jobs_dir (whose wrapper predates this
-    feature) starts honouring inner run-options without a fresh
-    submission.
+    `check-jobs --recreate --skip-bad-files` so an existing jobs_dir (whose
+    wrapper predates this feature) starts honouring inner run-options without
+    a fresh submission.
 
     Returns True when the file was modified, False when already up-to-date.
     """
@@ -384,8 +384,4 @@ class ExecutorFactoryManualABC(ABC):
 
     @abstractmethod
     def submit_jobs(self, jobs):
-        pass
-
-    @abstractmethod
-    def recreate_jobs(self, jobs):
         pass
