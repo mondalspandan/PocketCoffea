@@ -331,6 +331,7 @@ def test_check_jobs_checks_proxy_only_when_resubmitting(tmp_path, monkeypatch):
 
     monkeypatch.setattr(check_jobs_module, "get_proxy_path", lambda: called.append(True) or "/tmp/x509")
     monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("X509_USER_PROXY", "")
     copied = []
     monkeypatch.setattr(check_jobs_module.os, "system", lambda cmd: copied.append(cmd) or 0)
 
@@ -346,6 +347,7 @@ def test_check_jobs_checks_proxy_only_when_resubmitting(tmp_path, monkeypatch):
     assert result.exit_code == 0
     assert called == [True]
     assert any("scp /tmp/x509" in cmd for cmd in copied)
+    assert os.environ["X509_USER_PROXY"] == str(tmp_path / "x509")
 
 
 def test_latest_job_out_uses_out_logs(tmp_path):
