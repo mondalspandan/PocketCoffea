@@ -127,13 +127,6 @@ def test_find_other_file_exclude_urls_skips_candidate(das_sites):
     assert out == ex.GLOBAL_XROOTD_REDIRECTOR + "store/data/foo.root"
 
 
-def test_find_other_file_blocklist_by_prefix_string(das_sites):
-    """blocklist entries may be xrootd prefix strings, not just Rucio site names."""
-    f = SITEA_PREFIX + "/store/data/foo.root"
-    das_sites["/store/data/foo.root"] = ["T2_X_SITEA", "T2_X_SITEC"]
-    out = ex.find_other_file(f, SITEMAP, blocklist={SITEA_PREFIX, SITEC_PREFIX})
-    # both replicas are behind blocklisted prefixes -> fall back to redirector
-    assert out == ex.GLOBAL_XROOTD_REDIRECTOR + "store/data/foo.root"
 
 
 def test_find_other_file_no_fallback_returns_unchanged(das_sites):

@@ -53,7 +53,7 @@ def test_no_xrootd_string_returns_no_xrootd_and_preserves_config(tmp_path, monke
     _patch_rewrite_deps(monkeypatch)
     filesets = _fileset([("sampleA", [SITEA_PREFIX + "/store/data/a.root"])])
     config_path = _dump_config(tmp_path, filesets)
-    log_path = tmp_path / "runner.log"
+    log_path = tmp_path / "job_0.out"
     log_path.write_text("ValueError: something unrelated\n")
 
     rc = helper.rewrite_config_from_log(config_path, log_path)
@@ -72,7 +72,7 @@ def test_xrootd_failure_rewrites_all_files_from_failed_site(tmp_path, monkeypatc
         ("sampleB", [SITEA_PREFIX + "/store/data/c.root"]),
     ])
     config_path = _dump_config(tmp_path, filesets)
-    log_path = tmp_path / "runner.log"
+    log_path = tmp_path / "job_0.out"
     log_path.write_text(f"OSError: XRootD error\n  file: {SITEA_PREFIX}/store/data/a.root\n")
 
     rc = helper.rewrite_config_from_log(config_path, log_path)
@@ -92,7 +92,7 @@ def test_xrootd_failure_with_no_url_change_returns_no_change(tmp_path, monkeypat
     monkeypatch.setattr(helper, "find_other_file", lambda filepath, sitemap, blocklist=None, rucio_client=None: filepath)
     filesets = _fileset([("sampleA", [SITEA_PREFIX + "/store/data/a.root"])])
     config_path = _dump_config(tmp_path, filesets)
-    log_path = tmp_path / "runner.log"
+    log_path = tmp_path / "job_0.out"
     log_path.write_text(f"received 0 bytes from XRootDSource while reading {SITEA_PREFIX}/store/data/a.root\n")
 
     rc = helper.rewrite_config_from_log(config_path, log_path)
@@ -105,7 +105,7 @@ def test_file_not_found_traceback_url_is_detected(tmp_path, monkeypatch):
     _patch_rewrite_deps(monkeypatch)
     filesets = _fileset([("sampleA", [SITEA_PREFIX + "/store/data/a.root"])])
     config_path = _dump_config(tmp_path, filesets)
-    log_path = tmp_path / "runner.log"
+    log_path = tmp_path / "job_0.out"
     log_path.write_text(
         "FileNotFoundError: file not found\n"
         "traceback line\n"
@@ -135,7 +135,7 @@ def test_failed_sites_file_blocklists_previous_sites_and_reaches_redirector(tmp_
     monkeypatch.setattr(helper, "find_other_file", fake_find_other_file)
     filesets = _fileset([("sampleA", [SITEB_PREFIX + "/store/data/a.root"])])
     config_path = _dump_config(tmp_path, filesets)
-    log_path = tmp_path / "runner.log"
+    log_path = tmp_path / "job_0.out"
     log_path.write_text(f"OSError: XRootD error\n  file: {SITEB_PREFIX}/store/data/a.root\n")
     failed_sites = tmp_path / "failed_sites.txt"
     failed_sites.write_text("T2_X_SITEA\n")

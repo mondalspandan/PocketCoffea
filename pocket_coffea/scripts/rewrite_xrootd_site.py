@@ -1,12 +1,16 @@
 import argparse
 from copy import deepcopy
-import re
 import sys
 
 import cloudpickle
 
 from pocket_coffea.utils.rucio import get_rucio_client, get_xrootd_sites_map
-from pocket_coffea.utils.site_rewrite import find_other_file, _site_of_url
+from pocket_coffea.utils.site_rewrite import (
+    _site_of_url,
+    _split_lfn,
+    extract_failed_url,
+    find_other_file,
+)
 
 
 EXIT_REWRITTEN = 0
@@ -14,31 +18,9 @@ EXIT_HELPER_ERROR = 1
 EXIT_NO_XROOTD = 2
 EXIT_NO_CHANGE = 3
 
-XROOTD_FAILURE_STRINGS = (
-    "OSError: XRootD error",
-    "received 0 bytes from XRootDSource",
-    "FileNotFoundError: file not found",
-)
-ROOT_URL_RE = re.compile(r"root://[^\s'\"<>]+?/store/[^\s'\",)]+")
-
-
-def extract_failed_url(log_text):
-    lines = log_text.splitlines()
-    for iln, line in enumerate(lines):
-        if not any(marker in line for marker in XROOTD_FAILURE_STRINGS):
-            continue
-        # The failing URL is often printed on a nearby traceback line, not the marker line itself.
-        nearby = "\n".join(lines[max(0, iln - 3): iln + 7])
-        match = ROOT_URL_RE.search(nearby)
-        if match:
-            return match.group(0).rstrip(".,;:")
-    return None
-
-
 def site_prefix(filepath):
-    if filepath.startswith("root:/") and "/store/" in filepath:
-        return filepath.split("/store/", 1)[0].rstrip("/")
-    return None
+    rootpref, _ = _split_lfn(filepath)
+    return rootpref.rstrip("/") if rootpref else None
 
 
 def _load_failed_sites(path):
@@ -91,7 +73,7 @@ def rewrite_config_from_log(config_file, log_file, failed_sites_file=None):
     with open(log_file) as handle:
         failed_url = extract_failed_url(handle.read())
     if failed_url is None:
-        print("No XRootD failure URL found in runner log.")
+        print("No XRootD failure URL found in .out log.")
         return EXIT_NO_XROOTD
 
     config = cloudpickle.load(open(config_file, "rb"))

@@ -14,9 +14,29 @@ importable in environments without the rucio package (the unit tests
 monkey-patch `_query_replicas` directly).
 """
 from copy import deepcopy
+import re
 
 
 GLOBAL_XROOTD_REDIRECTOR = "root://xrootd-cms.infn.it//"
+XROOTD_FAILURE_STRINGS = (
+    "OSError: XRootD error",
+    "received 0 bytes from XRootDSource",
+    "FileNotFoundError: file not found",
+)
+ROOT_URL_RE = re.compile(r"root://[^\s'\"<>]+?/store/[^\s'\",)]+")
+
+
+def extract_failed_url(log_text):
+    """Return the XRootD URL near the first known failure in a job .out log."""
+    lines = log_text.splitlines()
+    for line_number, line in enumerate(lines):
+        if not any(marker in line for marker in XROOTD_FAILURE_STRINGS):
+            continue
+        nearby = "\n".join(lines[max(0, line_number - 3): line_number + 7])
+        match = ROOT_URL_RE.search(nearby)
+        if match:
+            return match.group(0).rstrip(".,;:")
+    return None
 
 
 def _split_lfn(filepath):
@@ -100,11 +120,9 @@ def find_other_file(filepath, sitemap, blocklist=None, exclude_urls=None,
     (b) not in `blocklist`, (c) different from the file's current site, and
     (d) whose reconstructed PFN is not in `exclude_urls`.
 
-    `blocklist` entries may be either Rucio site names (``T2_US_Foo``) or
-    xrootd redirector-prefix strings (``root://...//``); both forms are
-    honoured, so the same call works for the executor's explicit
-    ``--blocklist-sites`` and for check-jobs' auto blacklist (which is keyed
-    on the prefix string).
+    `blocklist` entries are CMS/Rucio site names (for example
+    ``T2_CH_CERN``). XRootD prefixes are resolved from `sitemap` and are not
+    accepted as blocklist values.
 
     `exclude_urls` is an optional iterable of full PFNs that have already
     failed (check-jobs' ``xrootdfaillist.txt``); a candidate reconstructing
@@ -137,10 +155,6 @@ def find_other_file(filepath, sitemap, blocklist=None, exclude_urls=None,
             continue
         sitepath = sitemap[site]
         if not isinstance(sitepath, str):
-            continue
-        # check-jobs' auto blacklist is keyed on the sitepath prefix string,
-        # not the Rucio site name — treat a blocklisted prefix as blocked too.
-        if sitepath in blocklist:
             continue
         if rootpref in sitepath or sitepath in rootpref:
             continue

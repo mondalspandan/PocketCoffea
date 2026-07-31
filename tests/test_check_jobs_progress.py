@@ -292,13 +292,10 @@ def test_submit_resubmit_jobs_builds_one_dynamic_batch(tmp_path, monkeypatch):
     }
     state_file.write_text(json.dumps(job_state))
 
-    class SubmitOutput:
-        def read(self):
-            return "2 job(s) submitted to cluster 123.\n"
-
-    commands = []
-    monkeypatch.setattr(os, "popen", lambda command, mode: commands.append(command) or SubmitOutput())
-    monkeypatch.setattr(os, "system", lambda command: 0)
+    monkeypatch.setattr(
+        "pocket_coffea.scripts.check_jobs.condor_submit_job",
+        lambda folder, submit: (True, "2 job(s) submitted to cluster 123."),
+    )
 
     assert submit_resubmit_jobs(
         tmp_path, ["0", "2", "0"], job_state, state_file, []
@@ -308,7 +305,6 @@ def test_submit_resubmit_jobs_builds_one_dynamic_batch(tmp_path, monkeypatch):
     assert "queue PROC, QUEUE, CHUNKSIZE, CPUS, MEMORY from (" in resubmit_now
     assert "0 workday 100 4 8GB" in resubmit_now
     assert "2 tomorrow 250 8 16GB" in resubmit_now
-    assert len(commands) == 1
     assert job_state["0"]["resubmissions"] == 1
     assert job_state["2"]["resubmissions"] == 2
 
@@ -321,33 +317,6 @@ def test_ncpu_option_defaults_to_one_and_rejects_zero():
     result = CliRunner().invoke(check_jobs, ["--jobs-folder", "/unused", "--ncpu", "0"])
     assert result.exit_code != 0
     assert "not in the range" in result.output
-
-
-def test_check_jobs_checks_proxy_only_when_resubmitting(tmp_path, monkeypatch):
-    from pocket_coffea.scripts import check_jobs as check_jobs_module
-
-    (tmp_path / "job_state.json").write_text("{}")
-    called = []
-
-    monkeypatch.setattr(check_jobs_module, "get_proxy_path", lambda: called.append(True) or "/tmp/x509")
-    monkeypatch.setenv("HOME", str(tmp_path))
-    monkeypatch.setenv("X509_USER_PROXY", "")
-    copied = []
-    monkeypatch.setattr(check_jobs_module.os, "system", lambda cmd: copied.append(cmd) or 0)
-
-    result = CliRunner().invoke(check_jobs_module.check_jobs, ["--jobs-folder", str(tmp_path)])
-    assert result.exit_code == 0
-    assert called == []
-    assert copied == []
-
-    result = CliRunner().invoke(
-        check_jobs_module.check_jobs,
-        ["--jobs-folder", str(tmp_path), "--resubmit"],
-    )
-    assert result.exit_code == 0
-    assert called == [True]
-    assert any("scp /tmp/x509" in cmd for cmd in copied)
-    assert os.environ["X509_USER_PROXY"] == str(tmp_path / "x509")
 
 
 def test_latest_job_out_uses_out_logs(tmp_path):
@@ -379,3 +348,58 @@ def test_recreate_queue_sync_is_legacy_safe(tmp_path):
     from pocket_coffea.scripts.check_jobs import sync_dynamic_queue
 
     assert not sync_dynamic_queue(tmp_path, "job_0", "workday")
+
+
+def test_check_jobs_lock_records_session_metadata(tmp_path, monkeypatch):
+    from pocket_coffea.scripts import check_jobs
+
+    monkeypatch.setattr(check_jobs.socket, "gethostname", lambda: "lxplus-test")
+    monkeypatch.setattr(check_jobs.os, "getpid", lambda: 1234)
+    monkeypatch.setattr(check_jobs.sys, "argv", ["check-jobs", "-j", str(tmp_path)])
+
+    info = check_jobs.acquire_check_jobs_lock(tmp_path)
+    stored = json.loads((tmp_path / ".check_jobs.lock").read_text())
+
+    assert stored == info
+    assert stored["hostname"] == "lxplus-test"
+    assert stored["pid"] == 1234
+    assert stored["start_time"]
+    assert stored["command_line"]
+    assert stored["session_id"]
+    assert check_jobs.release_check_jobs_lock(tmp_path, info["session_id"])
+
+
+def test_check_jobs_lock_decline_displays_existing_session(tmp_path, monkeypatch, capsys):
+    from pocket_coffea.scripts import check_jobs
+
+    existing = {"hostname": "lxplus-old", "pid": 4321, "session_id": "old"}
+    (tmp_path / ".check_jobs.lock").write_text(json.dumps(existing))
+    monkeypatch.setattr(check_jobs.click, "confirm", lambda *args, **kwargs: False)
+
+    assert check_jobs.acquire_check_jobs_lock(tmp_path) is None
+    assert json.loads((tmp_path / ".check_jobs.lock").read_text()) == existing
+    output = capsys.readouterr().out
+    assert "lxplus-old" in output
+    assert "4321" in output
+    assert "stop it first" in output
+
+
+def test_check_jobs_lock_override_replaces_session_and_old_release_is_safe(tmp_path, monkeypatch):
+    from pocket_coffea.scripts import check_jobs
+
+    old = check_jobs.acquire_check_jobs_lock(tmp_path)
+    monkeypatch.setattr(check_jobs.click, "confirm", lambda *args, **kwargs: True)
+    new = check_jobs.acquire_check_jobs_lock(tmp_path)
+
+    assert new["session_id"] != old["session_id"]
+    assert json.loads((tmp_path / ".check_jobs.lock").read_text())["session_id"] == new["session_id"]
+    assert not check_jobs.release_check_jobs_lock(tmp_path, old["session_id"])
+    assert (tmp_path / ".check_jobs.lock").exists()
+    assert check_jobs.release_check_jobs_lock(tmp_path, new["session_id"])
+
+
+def test_out_parser_extracts_xrootd_failure():
+    from pocket_coffea.utils.site_rewrite import extract_failed_url
+
+    out = "OSError: XRootD error\nfile: root://T2.example//store/data/file.root\n"
+    assert extract_failed_url(out) == "root://T2.example//store/data/file.root"

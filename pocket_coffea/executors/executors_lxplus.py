@@ -256,13 +256,22 @@ cleanup() {{
     fi
     cleanup_started=1
     echo "Termination signal received."
+    if [[ -n "${{child:-}}" ]]; then
+        kill -TERM "$child" 2>/dev/null || true
+        for _ in {{1..50}}; do
+            if ! kill -0 "$child" 2>/dev/null; then
+                break
+            fi
+            sleep 0.1
+        done
+        if kill -0 "$child" 2>/dev/null; then
+            kill -KILL "$child" 2>/dev/null || true
+        fi
+        wait "$child" 2>/dev/null || true
+    fi
     rm -f "$JOBDIR/job_$JOBID.running" "$JOBDIR/job_$JOBID.idle"
     touch "$JOBDIR/job_$JOBID.timeout"
     echo "Marked job as timeout."
-    if [[ -n "${{child:-}}" ]]; then
-        kill -TERM "$child" 2>/dev/null || true
-        wait "$child" 2>/dev/null || true
-    fi
     exit 0
 }}
 
@@ -287,6 +296,12 @@ run_with_retries() {{
 
 rm -f $JOBDIR/job_$JOBID.idle
 
+if [ "$4" -gt 1 ]; then
+    EXECUTOR_ARGS=(--executor futures --scaleout "$4")
+else
+    EXECUTOR_ARGS=(--executor iterative)
+fi
+
 echo "Starting job $JOBID"
 touch $JOBDIR/job_$JOBID.running
 
@@ -296,7 +311,7 @@ failed_xrootd_sites="$_CONDOR_SCRATCH_DIR/failed_xrootd_sites.txt"
 while true; do
     attempt_log="$_CONDOR_SCRATCH_DIR/job_attempt_${{attempt}}.out"
     echo "Runner attempt $attempt"
-    {runnercmd} --cfg $2 -o output EXECUTOR --chunksize $3 --custom-run-options {inner_yaml_basename} > "$attempt_log" 2>&1 &
+    {runnercmd} --cfg "$2" -o output "${{EXECUTOR_ARGS[@]}}" --chunksize "$3" --custom-run-options {inner_yaml_basename} > "$attempt_log" 2>&1 &
     child=$!
     wait "$child"
     runner_status=$?
@@ -336,10 +351,6 @@ fi
 echo 'Done'
 """
 
-    if int(cores_per_worker) > 1:
-        script = script.replace("EXECUTOR", f"--executor futures --scaleout {cores_per_worker}")
-    else:
-        script = script.replace("EXECUTOR", "--executor iterative")
     return script
 
 
@@ -406,7 +417,9 @@ class ExecutorFactoryCondorCERN(ExecutorFactoryManualABC):
         abs_jobdir_path = os.path.abspath(self.jobs_dir)
         os.makedirs(f"{self.jobs_dir}/logs", exist_ok=True)
         
-        env_extras_list=get_worker_env(self.run_options,self.x509_path,"condor")
+        env_extras_list = get_worker_env(
+            self.run_options, getattr(self, "x509_path", ""), "condor"
+        )
         env_extras= "\n".join(env_extras_list)
 
         if os.getenv("PYTHONPATH"):
@@ -445,6 +458,13 @@ class ExecutorFactoryCondorCERN(ExecutorFactoryManualABC):
         # leaking through.
         inner_yaml_path = write_inner_run_options(self.jobs_dir, self.run_options)
         inner_yaml_basename = os.path.basename(inner_yaml_path)
+        transfer_input_files = [
+            f"{abs_jobdir_path}/config_job_$(ProcId).pkl",
+            f"{abs_jobdir_path}/job.sh",
+            f"{abs_jobdir_path}/{inner_yaml_basename}",
+        ]
+        if not self.run_options["ignore-grid-certificate"]:
+            transfer_input_files.insert(1, self.x509_path)
 
         # Build the per-job wrapper (extracted into build_job_script so it is unit-testable).
         script = build_job_script(
@@ -486,7 +506,7 @@ class ExecutorFactoryCondorCERN(ExecutorFactoryManualABC):
             'should_transfer_files':'YES',
             'when_to_transfer_output' : 'ON_EXIT',
             'transfer_output_files' : '',
-            'transfer_input_files' : f"{abs_jobdir_path}/config_job_$(ProcId).pkl,{self.x509_path},{abs_jobdir_path}/job.sh,{abs_jobdir_path}/{inner_yaml_basename}",
+            'transfer_input_files' : ",".join(transfer_input_files),
             'on_exit_remove': '(ExitBySignal == False) && (ExitCode == 0)',
             'max_retries' : self.run_options["retries"],
             'requirements' : 'Machine =!= LastRemoteHost'
@@ -524,9 +544,8 @@ class ExecutorFactoryCondorCERN(ExecutorFactoryManualABC):
             "RequestCpus": "$(CPUS)",
             "RequestMemory": "$(MEMORY)",
             "arguments": "$(PROC) config_job_$(PROC).pkl $(CHUNKSIZE) $(CPUS)",
-            "transfer_input_files": (
-                f"{abs_jobdir_path}/config_job_$(PROC).pkl,{self.x509_path},"
-                f"{abs_jobdir_path}/job.sh,{abs_jobdir_path}/{inner_yaml_basename}"
+            "transfer_input_files": ",".join(
+                path.replace("$(ProcId)", "$(PROC)") for path in transfer_input_files
             ),
         })
         with open(f"{self.jobs_dir}/resubmit.sub", "w") as f:

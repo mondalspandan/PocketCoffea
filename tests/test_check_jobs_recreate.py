@@ -151,7 +151,8 @@ def test_recreate_queue_forced(tmp_path, replicas):
 def test_recreate_running_job_gets_queue_bump(tmp_path, replicas):
     f = SITEA + "/store/data/foo.root"
     d = _make_jobs_dir(tmp_path, {"job_0": {"filesets": _fs([f]), "flag": "running", "flavour": "espresso"}})
-    check_jobs.recreate_jobs_oneshot(d, "auto", use_redirector=True, dry_run=True)
+    check_jobs.recreate_jobs_oneshot(d, "auto", use_redirector=True,
+                                     remove_running=True, dry_run=True)
     # running job with no explicit --recreate-queue -> implicit one-step bump
     assert '+JobFlavour="microcentury"' in (d / "job_0.sub").read_text()
 
@@ -161,6 +162,19 @@ def test_recreate_blocklist_rewrites_to_alt_site(tmp_path, replicas):
     replicas["/store/data/foo.root"] = ["T2_X_SITEA", "T2_X_SITEC"]
     d = _make_jobs_dir(tmp_path, {"job_0": {"filesets": _fs([f]), "flag": "failed"}})
     check_jobs.recreate_jobs_oneshot(d, "0", blocklist_sites={"T2_X_SITEA"}, dry_run=True)
+    assert _load_files(d / "config_job_0.pkl") == [SITEC + "/store/data/foo.root"]
+
+
+def test_recreate_reads_xrootd_failure_from_out(tmp_path, replicas):
+    f = SITEA + "/store/data/foo.root"
+    replicas["/store/data/foo.root"] = ["T2_X_SITEA", "T2_X_SITEC"]
+    d = _make_jobs_dir(tmp_path, {"job_0": {"filesets": _fs([f]), "flag": "failed"}})
+    (d / "logs" / "job_123.0.out").write_text(
+        f"OSError: XRootD error\nfile: {f}\n"
+    )
+
+    check_jobs.recreate_jobs_oneshot(d, "0", dry_run=True)
+
     assert _load_files(d / "config_job_0.pkl") == [SITEC + "/store/data/foo.root"]
 
 
@@ -215,13 +229,10 @@ def test_recreate_skip_bad_files_materializes_inner_yaml(tmp_path, replicas):
 def test_recreate_dry_run_false_submits_and_flips_flags(tmp_path, replicas, monkeypatch):
     f = SITEA + "/store/data/foo.root"
     d = _make_jobs_dir(tmp_path, {"job_0": {"filesets": _fs([f]), "flag": "failed"}})
-    calls = []
-    monkeypatch.setattr(check_jobs.os, "system", lambda cmd: calls.append(cmd) or 0)
+    monkeypatch.setattr(check_jobs, "condor_submit_job", lambda folder, submit: (True, "1 job submitted"))
     check_jobs.recreate_jobs_oneshot(d, "0", use_redirector=True, dry_run=False)
-    joined = "\n".join(calls)
-    assert "condor_submit job_0.sub" in joined
-    assert "touch" in joined and "job_0.idle" in joined
-    assert "rm" in joined and "job_0.failed" in joined
+    assert (d / "job_0.idle").exists()
+    assert not (d / "job_0.failed").exists()
 
 
 def test_recreate_missing_jobs_config_is_graceful(tmp_path, replicas):
@@ -235,18 +246,19 @@ def test_condor_rm_job_constraint(monkeypatch):
     captured = {}
 
     class _R:
-        def read(self):
-            return "1 job removed\n"
+        returncode = 0
+        stdout = "1 job removed\n"
 
-    def fake_popen(cmd):
-        captured["cmd"] = cmd
+    def fake_run(args, **kwargs):
+        captured["args"] = args
         return _R()
 
-    monkeypatch.setattr(check_jobs.os, "popen", fake_popen)
-    out = check_jobs.condor_rm_job("job_7")
-    assert "condor_rm" in captured["cmd"]
-    # unique per-job key, escaped dot so job_7 != job_70
-    assert "config_job_7\\.pkl" in captured["cmd"]
+    monkeypatch.setattr(check_jobs.subprocess, "run", fake_run)
+    ok, out = check_jobs.condor_rm_job("job_7")
+    assert ok
+    assert captured["args"][:2] == ["condor_rm", "-constraint"]
+    assert captured["args"][2] == check_jobs.condor_job_constraint("job_7")
+    assert 'regexp("config_job_7\\.pkl", Args)' == captured["args"][2]
     assert out == "1 job removed"
 
 
@@ -259,8 +271,9 @@ def test_recreate_remove_running_kills_queued_jobs(tmp_path, replicas, monkeypat
     })
     removed = []
     monkeypatch.setattr(check_jobs, "condor_rm_job",
-                        lambda job: removed.append(job) or "1 job removed")
-    monkeypatch.setattr(check_jobs.os, "system", lambda cmd: 0)
+                        lambda job: removed.append(job) or (True, "1 job removed"))
+    monkeypatch.setattr(check_jobs, "condor_submit_job",
+                        lambda folder, submit: (True, "1 job submitted"))
     check_jobs.recreate_jobs_oneshot(d, "auto", use_redirector=True,
                                      remove_running=True, dry_run=False)
     # only the running + idle (queued) jobs are condor_rm'd; the failed one is not
@@ -285,3 +298,46 @@ def test_recreate_remove_running_off_by_default(tmp_path, replicas, monkeypatch)
     monkeypatch.setattr(check_jobs.os, "system", lambda cmd: 0)
     check_jobs.recreate_jobs_oneshot(d, "auto", use_redirector=True, dry_run=False)
     assert removed == []
+
+
+def test_failed_condor_rm_keeps_active_job_and_skips_submit(tmp_path, replicas, monkeypatch):
+    f = SITEA + "/store/data/foo.root"
+    d = _make_jobs_dir(tmp_path, {"job_0": {"filesets": _fs([f]), "flag": "running"}})
+    submitted = []
+    monkeypatch.setattr(check_jobs, "condor_rm_job", lambda job: (False, "permission denied"))
+    monkeypatch.setattr(check_jobs, "condor_submit_job",
+                        lambda *args: submitted.append(args) or (True, "unexpected"))
+
+    check_jobs.recreate_jobs_oneshot(d, "auto", use_redirector=True,
+                                     remove_running=True, dry_run=False)
+
+    assert submitted == []
+    assert (d / "job_0.running").exists()
+    assert not (d / "job_0.idle").exists()
+
+
+def test_recreate_clears_all_markers_and_creates_one_idle(tmp_path, replicas, monkeypatch):
+    f = SITEA + "/store/data/foo.root"
+    d = _make_jobs_dir(tmp_path, {"job_0": {"filesets": _fs([f]), "flag": "failed"}})
+    for marker in ("idle", "running", "done", "failed", "timeout"):
+        (d / f"job_0.{marker}").write_text("")
+    monkeypatch.setattr(check_jobs, "condor_rm_job", lambda job: (True, "removed"))
+    monkeypatch.setattr(check_jobs, "condor_submit_job", lambda folder, submit: (True, "submitted"))
+
+    check_jobs.recreate_jobs_oneshot(d, "0", use_redirector=True,
+                                     remove_running=True, dry_run=False)
+
+    assert [p.name for p in d.glob("job_0.*") if p.suffix[1:] in check_jobs.JOB_MARKERS] == ["job_0.idle"]
+
+
+def test_recreate_auto_includes_timeout_jobs(tmp_path, replicas, monkeypatch):
+    f = SITEA + "/store/data/foo.root"
+    d = _make_jobs_dir(tmp_path, {"job_0": {"filesets": _fs([f]), "flag": "timeout"}})
+    submitted = []
+    monkeypatch.setattr(check_jobs, "condor_submit_job",
+                        lambda folder, submit: submitted.append(submit) or (True, "submitted"))
+
+    check_jobs.recreate_jobs_oneshot(d, "auto", use_redirector=True, dry_run=False)
+
+    assert submitted == ["job_0.sub"]
+    assert (d / "job_0.idle").exists()

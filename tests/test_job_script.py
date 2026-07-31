@@ -64,13 +64,15 @@ def test_timeout_and_xrootd_recovery_are_in_the_wrapper():
     assert "job_$JOBID.timeout" in script
     assert "MAX_XROOTD_REWRITES=10" in script
     assert "python -m pocket_coffea.scripts.rewrite_xrootd_site" in script
+    cleanup = script.split("cleanup() {", 1)[1].split("trap cleanup", 1)[0]
+    assert cleanup.index('wait "$child"') < cleanup.index('touch "$JOBDIR/job_$JOBID.timeout"')
 
 
 def test_non_split_copies_from_job_local_output():
     script = _script(split_by_category=False)
     assert "output/output_all.coffea /abs/out/output_job_$JOBID.coffea" in script
-    assert "EXECUTOR" not in script  # placeholder was substituted
-    assert "--executor iterative" in script
+    assert 'EXECUTOR_ARGS=(--executor iterative)' in script
+    assert 'if [ "$4" -gt 1 ]' in script
 
 
 def test_split_by_category_runs_in_output_and_is_exit_checked():
@@ -81,5 +83,6 @@ def test_split_by_category_runs_in_output_and_is_exit_checked():
     # Split/copy failures mark the job failed rather than falling through to .done.
     assert "split-output failed" in script
     assert "${f%.coffea}_job_$JOBID.coffea" in script
-    # multi-core -> futures executor with scaleout.
-    assert "--executor futures --scaleout 4" in script
+    # Runtime CPU argument selects futures and carries the same scaleout value.
+    assert 'EXECUTOR_ARGS=(--executor futures --scaleout "$4")' in script
+    assert '"${EXECUTOR_ARGS[@]}"' in script

@@ -12,6 +12,11 @@ The status of the jobs can be checked by looking at the file in the jobs folder.
 '''
 
 import os
+import fcntl
+import socket
+import subprocess
+import sys
+import uuid
 import yaml
 import cloudpickle
 import click
@@ -27,7 +32,7 @@ from rich.layout import Layout
 from rich.panel import Panel
 import time
 import re
-from collections import Counter
+from functools import wraps
 from pocket_coffea.utils.job_progress import (
     aggregate_by_group,
     load_job_to_group_map,
@@ -36,6 +41,7 @@ from pocket_coffea.utils.job_progress import (
 from pocket_coffea.utils.network import get_proxy_path
 from pocket_coffea.utils.rucio import get_xrootd_sites_map, get_rucio_client
 from pocket_coffea.utils.site_rewrite import (
+    extract_failed_url,
     find_other_file,
     rewrite_fileset_blocklist,
     rewrite_fileset_to_redirector,
@@ -52,6 +58,134 @@ queues = [
     "testmatch",
     "nextweek"
 ]
+
+LOCK_FILENAME = ".check_jobs.lock"
+JOB_MARKERS = ("idle", "running", "done", "failed", "timeout")
+
+
+def _resolve_jobs_folder(jobs_folder):
+    jobs_folder = Path(jobs_folder)
+    if len(os.listdir(jobs_folder)) == 1 and (jobs_folder / "job").is_dir():
+        jobs_folder = jobs_folder / "job"
+    return jobs_folder
+
+
+def _new_lock_info():
+    return {
+        "hostname": socket.gethostname(),
+        "pid": os.getpid(),
+        "start_time": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "command_line": " ".join(shlex_quote(arg) for arg in sys.argv),
+        "session_id": uuid.uuid4().hex,
+    }
+
+
+def shlex_quote(value):
+    """Quote one argv item without requiring Python 3.8's shlex.join."""
+    import shlex
+    return shlex.quote(value)
+
+
+def _write_lock(path, info, exclusive):
+    flags = os.O_WRONLY | os.O_CREAT
+    if exclusive:
+        flags |= os.O_EXCL
+    fd = os.open(path, flags, 0o644)
+    try:
+        with os.fdopen(fd, "w") as handle:
+            json.dump(info, handle, sort_keys=True)
+            handle.write("\n")
+    except Exception:
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            pass
+        raise
+
+
+def acquire_check_jobs_lock(jobs_folder):
+    """Atomically create or explicitly override the per-jobs-dir lock."""
+    path = Path(jobs_folder) / LOCK_FILENAME
+    info = _new_lock_info()
+    try:
+        _write_lock(path, info, exclusive=True)
+        return info
+    except FileExistsError:
+        try:
+            fd = os.open(path, os.O_RDWR)
+        except FileNotFoundError:
+            return acquire_check_jobs_lock(jobs_folder)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            with os.fdopen(os.dup(fd)) as handle:
+                try:
+                    existing = json.load(handle)
+                except ValueError:
+                    existing = {}
+            rprint(
+                f"[yellow]check-jobs is already running on "
+                f"{existing.get('hostname', 'unknown host')} "
+                f"(PID {existing.get('pid', 'unknown')}).[/]"
+            )
+            rprint("Use that existing session or stop it first.")
+            if not click.confirm("Proceed anyway despite the risk?", default=False):
+                return None
+
+            temporary = path.with_name(f"{path.name}.{info['session_id']}.tmp")
+            try:
+                _write_lock(temporary, info, exclusive=True)
+                os.replace(temporary, path)
+            finally:
+                try:
+                    temporary.unlink()
+                except FileNotFoundError:
+                    pass
+            return info
+        finally:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+            os.close(fd)
+
+
+def release_check_jobs_lock(jobs_folder, session_id):
+    path = Path(jobs_folder) / LOCK_FILENAME
+    try:
+        fd = os.open(path, os.O_RDONLY)
+    except OSError:
+        return False
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        try:
+            if os.fstat(fd).st_ino != os.stat(path).st_ino:
+                return False
+            with os.fdopen(os.dup(fd)) as handle:
+                try:
+                    info = json.load(handle)
+                except ValueError:
+                    return False
+            if info.get("session_id") != session_id:
+                return False
+            path.unlink()
+            return True
+        except FileNotFoundError:
+            return False
+    finally:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
+
+
+def _with_check_jobs_lock(function):
+    @wraps(function)
+    def wrapped(*args, **kwargs):
+        jobs_folder = _resolve_jobs_folder(kwargs["jobs_folder"])
+        lock = acquire_check_jobs_lock(jobs_folder)
+        if lock is None:
+            return None
+        kwargs["jobs_folder"] = jobs_folder
+        try:
+            return function(*args, **kwargs)
+        finally:
+            release_check_jobs_lock(jobs_folder, lock["session_id"])
+    return wrapped
 
 
 
@@ -160,31 +294,61 @@ def get_progress_table(group_counts, label, multi_sample_overlap=False, bar_widt
         )
     return table
 
-def update_blacklist(xrootdfaillist, blacklist_threshold):
-    sitepathlist = [i.split("/store/")[0] for i in xrootdfaillist]
-    failedsitecounter = Counter(sitepathlist)
-    blacklist_sites = []
-    for site,fails in failedsitecounter.items():
-        if fails > blacklist_threshold:
-            blacklist_sites.append(site)
-    return blacklist_sites
-
 def condor_rm_job(job):
     """condor_rm any still-queued/running HTCondor instance of `job` (a
     ``job_<n>`` name) so a recreated job's old instance can't keep running and
     double-write its output.
 
     The instance is matched on the per-job ``config_job_<n>.pkl`` that appears
-    in the job's condor ``Arguments`` (unique per job index, so ``job_1`` is not
-    confused with ``job_10``). Returns the ``condor_rm`` output, or ``""`` if
-    nothing matched.
+    in the job's condor ``Args`` ClassAd (unique per job index, so ``job_1`` is not
+    confused with ``job_10``). Returns ``(success, output)`` from ``condor_rm``.
     """
-    idx = job.split("_")[-1]
-    constraint = f'regexp("config_job_{idx}\\.pkl", Arguments)'
+    constraint = condor_job_constraint(job)
     try:
-        return os.popen(f"condor_rm -constraint '{constraint}'").read().strip()
-    except Exception as e:
-        return f"condor_rm failed: {e}"
+        result = subprocess.run(
+            ["condor_rm", "-constraint", constraint],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            check=False,
+        )
+    except OSError as exc:
+        return False, f"condor_rm failed: {exc}"
+    return result.returncode == 0, result.stdout.strip()
+
+
+def condor_job_constraint(job):
+    """Return the lxplus ClassAd constraint for one config pickle."""
+    idx = job.split("_")[-1]
+    return f'regexp("config_job_{idx}\\.pkl", Args)'
+
+
+def condor_submit_job(jobs_folder, submit_file):
+    try:
+        result = subprocess.run(
+            ["condor_submit", submit_file],
+            cwd=str(jobs_folder),
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            check=False,
+        )
+    except OSError as exc:
+        return False, f"condor_submit failed: {exc}"
+    return result.returncode == 0, result.stdout.strip()
+
+
+def clear_job_markers(jobs_folder, job):
+    for marker in JOB_MARKERS:
+        try:
+            (Path(jobs_folder) / f"{job}.{marker}").unlink()
+        except FileNotFoundError:
+            pass
+
+
+def mark_job_idle(jobs_folder, job):
+    clear_job_markers(jobs_folder, job)
+    (Path(jobs_folder) / f"{job}.idle").touch()
 
 
 def recreate_jobs_oneshot(jobs_folder, jobs_to_recreate, *, use_redirector=False,
@@ -200,7 +364,7 @@ def recreate_jobs_oneshot(jobs_folder, jobs_to_recreate, *, use_redirector=False
     failed **and** running/idle jobs, e.g. to move everything off a blocklisted
     site or onto the global xrootd redirector mid-run.
 
-    `jobs_to_recreate` is ``"auto"`` (scan ``*.failed``/``*.running``/``*.idle``
+    `jobs_to_recreate` is ``"auto"`` (scan ``*.failed``/``*.running``/``*.idle``/``*.timeout``
     flag files) or a comma list (``0,1,3`` or ``job_0,job_3``).
 
     When `remove_running` is set, each recreated job that is still queued in
@@ -241,9 +405,10 @@ def recreate_jobs_oneshot(jobs_folder, jobs_to_recreate, *, use_redirector=False
         failedjobs = [f[:-len(".failed")] for f in os.listdir(jobs_folder) if f.endswith(".failed")]
         runningjobs = [f[:-len(".running")] for f in os.listdir(jobs_folder) if f.endswith(".running")]
         idlejobs = [f[:-len(".idle")] for f in os.listdir(jobs_folder) if f.endswith(".idle")]
-        jobs_to_redo = failedjobs + runningjobs + idlejobs
+        timeoutjobs = [f[:-len(".timeout")] for f in os.listdir(jobs_folder) if f.endswith(".timeout")]
+        jobs_to_redo = list(dict.fromkeys(failedjobs + runningjobs + idlejobs + timeoutjobs))
         if not jobs_to_redo:
-            rprint(f"[green]No *.failed/*.running/*.idle jobs found in {jobs_folder}; "
+            rprint(f"[green]No *.failed/*.running/*.idle/*.timeout jobs found in {jobs_folder}; "
                    f"nothing to recreate.[/]")
             return
     else:
@@ -253,6 +418,7 @@ def recreate_jobs_oneshot(jobs_folder, jobs_to_recreate, *, use_redirector=False
             if not j:
                 continue
             jobs_to_redo.append(j if j.startswith("job_") else f"job_{j}")
+        jobs_to_redo = list(dict.fromkeys(jobs_to_redo))
         # Derive current flag states from disk (the old executor path left these
         # undefined for explicit lists, crashing on `job in runningjobs`).
         failedjobs = [j for j in jobs_to_redo if (jobs_folder / f"{j}.failed").exists()]
@@ -260,26 +426,12 @@ def recreate_jobs_oneshot(jobs_folder, jobs_to_recreate, *, use_redirector=False
         idlejobs = [j for j in jobs_to_redo if (jobs_folder / f"{j}.idle").exists()]
     rprint(f"Recreating jobs: {jobs_to_redo}")
 
-    # Optionally kill the still-queued (running/idle) HTCondor instance of each
-    # recreated job so it can't keep running and double-write its output.
-    if remove_running:
-        queued = [j for j in jobs_to_redo if j in set(runningjobs) | set(idlejobs)]
-        if queued:
-            rprint(f"[recreate] Removing still-queued condor instances of: {queued}")
-        for j in queued:
-            if dry_run:
-                rprint(f"[dim]Dry run, not running condor_rm for {j}[/]")
-                continue
-            out = condor_rm_job(j)
-            rprint(f"[recreate] condor_rm {j}: {out or 'no matching queued job'}")
-
     # Jobs that failed due to an XRootD error get a per-file alternate-site lookup.
-    xrootd_err_logs = os.popen(f"grep -il {jobs_folder}/logs/*.err -e 'XRootD error'").read().split()
-    xrootd_fail_jobs = ["job_" + f.split("/")[-1].split(".")[-2] for f in xrootd_err_logs]
-    if xrootd_err_logs:
-        backupdir = f"{jobs_folder}/logs/processed"
-        os.makedirs(backupdir, exist_ok=True)
-        os.system(f"mv {' '.join(xrootd_err_logs)} {backupdir}")
+    xrootd_fail_jobs = []
+    for job in jobs_to_redo:
+        out_file = latest_job_out(jobs_folder, job)
+        if out_file and extract_failed_url(Path(out_file).read_text(errors="replace")):
+            xrootd_fail_jobs.append(job)
 
     sitemap = get_xrootd_sites_map()
     if blocklist_sites:
@@ -310,6 +462,18 @@ def recreate_jobs_oneshot(jobs_folder, jobs_to_recreate, *, use_redirector=False
         if job not in jobs_config["jobs_list"]:
             rprint(f"[yellow]Job {job} not found in jobs_config.yaml; skipping.[/]")
             continue
+
+        active = job in set(runningjobs) | set(idlejobs)
+        if active and not remove_running:
+            rprint(f"[yellow]Refusing to recreate active {job}; pass --remove-running "
+                   "to remove its existing HTCondor job first.[/]")
+            continue
+        if active and not dry_run:
+            removed, output = condor_rm_job(job)
+            rprint(f"[recreate] condor_rm {job}: {output or 'no output'}")
+            if not removed:
+                rprint(f"[red]Could not remove {job}; leaving markers and skipping resubmission.[/]")
+                continue
 
         # Source the ORIGINAL fileset from jobs_config.yaml (from-scratch) so
         # repeated recreates don't compound rewrites.
@@ -357,13 +521,12 @@ def recreate_jobs_oneshot(jobs_folder, jobs_to_recreate, *, use_redirector=False
         if dry_run:
             rprint(f"[dim]Dry run, not resubmitting {job}[/]")
             continue
-        if job in failedjobs:
-            os.system(f"rm {jobs_folder}/{job}.failed")
-        elif job in runningjobs:
-            os.system(f"rm {jobs_folder}/{job}.running")
-        os.system(f"touch {jobs_folder}/{job}.idle")
-        os.system(f"cd {jobs_folder} && condor_submit {job}.sub")
-        rprint(f"[green]Resubmitted {job}[/]")
+        submitted, output = condor_submit_job(jobs_folder, f"{job}.sub")
+        if submitted:
+            mark_job_idle(jobs_folder, job)
+            rprint(f"[green]Resubmitted {job}: {output or 'submitted'}[/]")
+        else:
+            rprint(f"[red]Failed to resubmit {job}: {output or 'condor_submit failed'}[/]")
 
 
 
@@ -449,15 +612,12 @@ def submit_resubmit_jobs(jobs_folder, job_nums, job_state, state_file, log_text)
     if job_state is None or not (Path(jobs_folder) / "resubmit.sub").exists():
         succeeded = True
         for job_num in job_nums:
-            output = os.popen(
-                f"cd {jobs_folder} && condor_submit job_{job_num}.sub", "r"
-            ).read()
-            log_text.append(output.strip())
-            if "job(s) submitted to cluster" not in output:
+            submitted, output = condor_submit_job(jobs_folder, f"job_{job_num}.sub")
+            log_text.append(output)
+            if not submitted:
                 succeeded = False
                 continue
-            os.system(f"rm -f {jobs_folder}/job_{job_num}.failed")
-            os.system(f"touch {jobs_folder}/job_{job_num}.idle")
+            mark_job_idle(jobs_folder, f"job_{job_num}")
         return succeeded
 
     job_nums = [job_num for job_num in job_nums if job_num in job_state]
@@ -477,15 +637,11 @@ def submit_resubmit_jobs(jobs_folder, job_nums, job_state, state_file, log_text)
             )
         f.write(")\n")
 
-    resubmit_log = os.popen(
-        f"cd {jobs_folder} && condor_submit resubmit_now.sub", "r"
-    ).read()
-    resubmit_succeeded = "job(s) submitted to cluster" in resubmit_log
-    log_text.append(resubmit_log.strip())
+    resubmit_succeeded, resubmit_log = condor_submit_job(jobs_folder, "resubmit_now.sub")
+    log_text.append(resubmit_log)
     if resubmit_succeeded:
         for job_num in job_nums:
-            os.system(f"rm -f {jobs_folder}/job_{job_num}.failed")
-            os.system(f"touch {jobs_folder}/job_{job_num}.idle")
+            mark_job_idle(jobs_folder, f"job_{job_num}")
             job_state[job_num]["resubmissions"] += 1
         save_job_state(state_file, job_state)
         log_text.append(f"[red]Resubmitted {len(job_nums)} failed jobs to condor[/]")
@@ -510,15 +666,12 @@ def convert_timeout_jobs(jobs_folder, timeout_jobs, running_jobs, idle_jobs, fai
     for job in list(timeout_jobs):
         if job in running_jobs:
             running_jobs.remove(job)
-            os.system(f"rm -f {jobs_folder}/{job}.running")
         if job in idle_jobs:
             idle_jobs.remove(job)
-            os.system(f"rm -f {jobs_folder}/{job}.idle")
-
-        os.system(f"rm -f {jobs_folder}/{job}.timeout")
+        clear_job_markers(jobs_folder, job)
         if job not in failed_jobs:
             failed_jobs.append(job)
-        os.system(f"touch {jobs_folder}/{job}.failed")
+        (Path(jobs_folder) / f"{job}.failed").touch()
 
         job_num = job.split("_", 1)[1]
         next_jf = bump_jobqueue(job_num, job_state, state_file, queue_shift, ncpu)
@@ -549,27 +702,29 @@ def convert_timeout_jobs(jobs_folder, timeout_jobs, running_jobs, idle_jobs, fai
 @click.option("--use-redirector", is_flag=True, default=False,
               help="Use the global XRootD redirector for recreation or as retry fallback.")
 @click.option("--blocklist-sites", type=str, default=None,
-              help="Comma-separated CMS sites or XRootD prefixes to avoid.")
+              help="Comma-separated CMS/Rucio site names to avoid (for example T2_CH_CERN).")
 @click.option("--recreate-queue", type=str, default=None,
               help="Force recreated jobs to this HTCondor queue.")
 @click.option("--skip-bad-files", is_flag=True, default=False,
               help="Enable Coffea skip-bad-files for recreated jobs.")
 @click.option("--remove-running", is_flag=True, default=False,
               help="Remove queued/running Condor instances before recreation.")
+@_with_check_jobs_lock
 def check_jobs(jobs_folder, details, resubmit, max_resubmit, blacklist_threshold,
                queue_shift, ncpu,
                group_by, recreate, once, use_redirector, blocklist_sites,
                recreate_queue, skip_bad_files, remove_running):
-    # check if the user passed the parent folder
-    subdirs = os.listdir(jobs_folder)
-    if len(subdirs) == 1 and subdirs[0] == "job":
-        jobs_folder = os.path.join(jobs_folder,"job")
-
-    jobs_folder = Path(jobs_folder)
+    jobs_folder = _resolve_jobs_folder(jobs_folder)
 
     explicit_blocklist = {
         site.strip() for site in blocklist_sites.split(",") if site.strip()
     } if blocklist_sites else set()
+    invalid_blocklist = [site for site in explicit_blocklist if site.startswith("root://")]
+    if invalid_blocklist:
+        raise click.BadParameter(
+            "--blocklist-sites accepts CMS/Rucio site names, not XRootD prefixes: "
+            + ", ".join(sorted(invalid_blocklist))
+        )
     if recreate is not None:
         recreate_jobs_oneshot(
             jobs_folder,
