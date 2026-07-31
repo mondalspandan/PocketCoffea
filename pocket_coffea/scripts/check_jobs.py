@@ -53,6 +53,7 @@ from pocket_coffea.utils.htcondor_queue import QUEUES, bump_queue, set_queue
 LOCK_FILENAME = ".check_jobs.lock"
 JOB_MARKERS = ("idle", "running", "done", "failed", "timeout")
 CONDOR_REMOVAL_TIMEOUT = 10.0
+RESOURCE_SCALED_MARKER = "# check-jobs-resources-scaled"
 
 
 def _resolve_jobs_folder(jobs_folder):
@@ -552,7 +553,7 @@ def recreate_jobs_oneshot(jobs_folder, jobs_to_recreate, *, use_redirector=False
             selected_queue = recreate_queue
 
         if selected_queue is not None:
-            sync_dynamic_queue(jobs_folder, job, selected_queue)
+            sync_dynamic_queue(jobs_folder, job, selected_queue, job_state, state_file)
 
         if dry_run:
             rprint(f"[dim]Dry run, not resubmitting {job}[/]")
@@ -577,17 +578,18 @@ def save_job_state(state_file, job_state):
         json.dump(job_state, f, indent=2, sort_keys=True)
 
 
-def sync_dynamic_queue(jobs_folder, job_name, queue):
+def sync_dynamic_queue(jobs_folder, job_name, queue, job_state=None, state_file=None):
     """Keep proactive recreation and dynamic reactive retries on one queue."""
-    state_file = Path(jobs_folder) / "job_state.json"
-    if not state_file.exists():
-        return False
-    state = load_job_state(state_file)
+    state_file = Path(state_file) if state_file is not None else Path(jobs_folder) / "job_state.json"
+    if job_state is None:
+        if not state_file.exists():
+            return False
+        job_state = load_job_state(state_file)
     job_num = job_name.split("_", 1)[1]
-    if job_num not in state:
+    if job_num not in job_state:
         return False
-    state[job_num]["queue"] = queue
-    save_job_state(state_file, state)
+    job_state[job_num]["queue"] = queue
+    save_job_state(state_file, job_state)
     return True
 
 
@@ -626,6 +628,8 @@ def update_job_submit_resources(sub_file, request_cpus, request_memory):
 def scale_submit_resources(sub_file, factor):
     with open(sub_file) as handle:
         content = handle.read()
+    if RESOURCE_SCALED_MARKER in content:
+        return False
     cpus_match = re.search(r"^RequestCpus\s*=\s*(\d+)\s*$", content, re.MULTILINE)
     memory_match = re.search(r"^RequestMemory\s*=\s*(\S+)\s*$", content, re.MULTILINE)
     if not cpus_match or not memory_match:
@@ -635,6 +639,8 @@ def scale_submit_resources(sub_file, factor):
         int(cpus_match.group(1)) * factor,
         scale_memory(memory_match.group(1), factor),
     )
+    with open(sub_file, "a") as handle:
+        handle.write(f"{RESOURCE_SCALED_MARKER}\n")
     return True
 
 

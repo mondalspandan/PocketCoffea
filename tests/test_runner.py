@@ -63,3 +63,11 @@ def test_resubmit_failed_without_file(base_path: Path, monkeypatch: pytest.Monke
     
     # Should fail (non-zero exit code)
     assert status != 0
+
+
+def test_lxplus_migration_check_is_executor_specific():
+    from pocket_coffea.scripts.runner import _lxplus_migration_flags
+    options = {"recreate-jobs": "auto"}
+    assert _lxplus_migration_flags("condor@lxplus", options) == ["recreate-jobs"]
+    assert _lxplus_migration_flags("condor@rubin", options) == []
+    assert _lxplus_migration_flags("iterative", options) == []

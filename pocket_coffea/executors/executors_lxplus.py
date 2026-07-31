@@ -251,25 +251,42 @@ cleanup_started=0
 
 terminate_child_group() {{
     if [[ -z "${{child:-}}" ]]; then
-        return
+        return 0
     fi
+    local group_gone=0
     if [[ -n "${{child_pgid:-}}" ]]; then
         kill -TERM -- "-${{child_pgid}}" 2>/dev/null || true
         for _ in {{1..50}}; do
             if ! kill -0 -- "-${{child_pgid}}" 2>/dev/null; then
+                group_gone=1
                 break
             fi
             sleep 0.1
         done
-        if kill -0 -- "-${{child_pgid}}" 2>/dev/null; then
+        if [ "$group_gone" -eq 0 ]; then
             kill -KILL -- "-${{child_pgid}}" 2>/dev/null || true
+            for _ in {{1..20}}; do
+                if ! kill -0 -- "-${{child_pgid}}" 2>/dev/null; then
+                    group_gone=1
+                    break
+                fi
+                sleep 0.1
+            done
         fi
     else
         kill -TERM "$child" 2>/dev/null || true
+        group_gone=1
     fi
     wait "$child" 2>/dev/null || true
+    if [[ -n "${{child_pgid:-}}" ]] && kill -0 -- "-${{child_pgid}}" 2>/dev/null; then
+        group_gone=0
+    fi
     child=""
     child_pgid=""
+    if [ "$group_gone" -eq 1 ]; then
+        return 0
+    fi
+    return 1
 }}
 
 cleanup() {{
@@ -279,7 +296,12 @@ cleanup() {{
     fi
     cleanup_started=1
     echo "Termination signal received."
-    terminate_child_group
+    if ! terminate_child_group; then
+        rm -f "$JOBDIR/job_$JOBID.running" "$JOBDIR/job_$JOBID.idle"
+        touch "$JOBDIR/job_$JOBID.failed"
+        echo "Worker process-group cleanup failed; job marked failed." >&2
+        exit 1
+    fi
     rm -f "$JOBDIR/job_$JOBID.running" "$JOBDIR/job_$JOBID.idle"
     touch "$JOBDIR/job_$JOBID.timeout"
     echo "Marked job as timeout."

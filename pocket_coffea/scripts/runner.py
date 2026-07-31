@@ -24,6 +24,13 @@ from pocket_coffea.parameters import defaults as parameters_utils
 from pocket_coffea.executors import executors_base, executors_manual_jobs
 from pocket_coffea.utils.benchmarking import print_processing_stats
 
+
+def _lxplus_migration_flags(executor, run_options):
+    if executor != "condor@lxplus":
+        return []
+    return [k for k in ("recreate-jobs", "use-redirector", "recreate-queue", "blocklist-sites")
+            if k in run_options]
+
 @click.command(context_settings=dict(ignore_unknown_options=True, allow_extra_args=True))
 @click.option('--cfg', required=True, type=str,
               help='Config file with parameters specific to the current run')
@@ -147,9 +154,8 @@ def run(cfg,  custom_run_options, outputdir, test, limit_files,
     # These flags used to be handled here (some as real options, --recreate-jobs
     # via the pass-through loop above). Fail loudly with a pointer instead of
     # silently ignoring them.
-    _moved_flags = [k for k in ("recreate-jobs", "use-redirector", "recreate-queue", "blocklist-sites")
-                    if k in run_options]
-    if executor == "condor@lxplus" and _moved_flags:
+    _moved_flags = _lxplus_migration_flags(executor, run_options)
+    if _moved_flags:
         rprint(f"[red]ERROR:[/] the manual-job recreate options {_moved_flags} have moved to "
                f"[bold]pocket-coffea check-jobs[/].")
         rprint("Use e.g. [yellow]pocket-coffea check-jobs -j <outputdir>/job --recreate auto "

@@ -128,10 +128,11 @@ class ExecutorFactoryManualABC(ABC):
         self.run_options = run_options
         self.job_name = run_options.get("job-name", "job")
         self.jobs_dir = os.path.join(run_options.get("jobs-dir", outputdir), self.job_name)
-        if os.path.exists(self.jobs_dir):
+        recreate_jobs = run_options.get("recreate-jobs")
+        if not recreate_jobs and os.path.exists(self.jobs_dir):
             print(f"Jobs directory {self.jobs_dir} already exists. Please clean it up before running the jobs.")
             exit(1)
-        else:
+        if not recreate_jobs:
             os.makedirs(self.jobs_dir)
         self.setup()
         # If handles_submission == True, the executor is responsible for submitting the job
@@ -176,6 +177,10 @@ class ExecutorFactoryManualABC(ABC):
 
 
     def submit(self, config, filesets, outputdir):
+        jobs_to_recreate = self.run_options.get("recreate-jobs")
+        if jobs_to_recreate:
+            self.recreate_jobs(jobs_to_recreate)
+            return
         # storing the job config
         self.config = config
         self.outputdir = outputdir

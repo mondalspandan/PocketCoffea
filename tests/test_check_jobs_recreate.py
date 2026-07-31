@@ -420,3 +420,57 @@ def test_failed_replacement_has_only_failed_marker(tmp_path, replicas, monkeypat
     monkeypatch.setattr(check_jobs, "condor_submit_job", lambda *args: (False, "bad submit"))
     check_jobs.recreate_jobs_oneshot(d, "0", use_redirector=True, dry_run=False)
     assert [p.name for p in d.glob("job_0.*") if p.suffix[1:] in check_jobs.JOB_MARKERS] == ["job_0.failed"]
+
+
+def test_multi_job_recreation_keeps_one_shared_job_state(tmp_path, replicas):
+    f = SITEA + "/store/data/foo.root"
+    d = _make_jobs_dir(tmp_path, {
+        "job_0": {"filesets": _fs([f]), "flag": "failed"},
+        "job_1": {"filesets": _fs([f]), "flag": "timeout"},
+    })
+    state = {
+        "0": {"queue": "espresso", "chunksize": 100, "base_cpus": 2,
+              "base_memory": "4GB", "request_cpus": 2, "request_memory": "4GB",
+              "resources_scaled": False, "resubmissions": 0},
+        "1": {"queue": "espresso", "chunksize": 100, "base_cpus": 2,
+              "base_memory": "4GB", "request_cpus": 2, "request_memory": "4GB",
+              "resources_scaled": False, "resubmissions": 0},
+    }
+    (d / "job_state.json").write_text(json.dumps(state))
+    check_jobs.recreate_jobs_oneshot(
+        d, "0,1", use_redirector=True, recreate_queue="workday",
+        ncpu=3, dry_run=True,
+    )
+    persisted = json.loads((d / "job_state.json").read_text())
+    assert persisted["0"]["queue"] == persisted["1"]["queue"] == "workday"
+    assert persisted["1"]["request_cpus"] == 6
+    assert persisted["1"]["request_memory"] == "12GB"
+    for job in ("job_0", "job_1"):
+        sub = (d / f"{job}.sub").read_text()
+        assert '+JobFlavour="workday"' in sub
+    assert "RequestCpus = 6" in (d / "job_1.sub").read_text()
+
+
+def test_legacy_timeout_resources_scale_only_once(tmp_path, replicas):
+    f = SITEA + "/store/data/foo.root"
+    d = _make_jobs_dir(tmp_path, {"job_0": {"filesets": _fs([f]), "flag": "timeout"}})
+    check_jobs.recreate_jobs_oneshot(d, "0", use_redirector=True, ncpu=2, dry_run=True)
+    check_jobs.recreate_jobs_oneshot(d, "0", use_redirector=True, ncpu=2, dry_run=True)
+    sub = (d / "job_0.sub").read_text()
+    assert "RequestCpus = 4" in sub
+    assert "RequestMemory = 8GB" in sub
+    assert "arguments = 0 config_job_0.pkl 100 4" in sub
+    assert sub.count(check_jobs.RESOURCE_SCALED_MARKER) == 1
+    assert '+JobFlavour="longlunch"' in sub
+
+
+def test_legacy_timeout_ncpu_one_records_scaling_decision(tmp_path, replicas):
+    f = SITEA + "/store/data/foo.root"
+    d = _make_jobs_dir(tmp_path, {"job_0": {"filesets": _fs([f]), "flag": "timeout"}})
+    check_jobs.recreate_jobs_oneshot(d, "0", use_redirector=True, ncpu=1, dry_run=True)
+    check_jobs.recreate_jobs_oneshot(d, "0", use_redirector=True, ncpu=3, dry_run=True)
+    sub = (d / "job_0.sub").read_text()
+    assert "RequestCpus = 2" in sub
+    assert "RequestMemory = 4GB" in sub
+    assert "arguments = 0 config_job_0.pkl 100 2" in sub
+    assert sub.count(check_jobs.RESOURCE_SCALED_MARKER) == 1

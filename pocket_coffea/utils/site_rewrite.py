@@ -35,6 +35,8 @@ def normalize_rse(site):
 
 def _site_map_entry(site, sitemap):
     normalized = normalize_rse(site)
+    if site in sitemap and isinstance(sitemap[site], str):
+        return normalized, sitemap[site]
     for mapped_site, sitepath in sitemap.items():
         if normalize_rse(mapped_site) == normalized and isinstance(sitepath, str):
             return normalized, sitepath

@@ -541,8 +541,8 @@ called `job`, the tool descends into it automatically.
 | `--once` | off | Run a single monitor/resubmit iteration then exit, instead of looping until all jobs finish. |
 | `--use-redirector` | off | With `--recreate`, rewrite every file through the global xrootd redirector (`root://xrootd-cms.infn.it//`) without Rucio lookups. Takes precedence over `--blocklist-sites`. |
 | `--blocklist-sites` | — | With `--recreate`, comma-separated CMS/Rucio site names (for example `T2_CH_CERN`) to avoid. XRootD prefixes are resolved from the site map and are not accepted here. Files at a blocklisted site are rewritten to an alternative replica via Rucio. |
-| `--recreate-queue` | — | Force each resubmitted job's HTCondor `+JobFlavour` to this queue (`espresso` … `nextweek`). Overrides the implicit `--queue-shift` bump for jobs removed due to time limit. |
-| `--skip-bad-files` | off | Retroactively enable Coffea's skip-bad-files in the inner job by (re)materialising `inner_run_options.yaml` and patching the jobs_dir. Most useful with `--recreate`. |
+| `--recreate-queue` | — | With `--recreate`, force each resubmitted job's HTCondor `+JobFlavour` to this queue (`espresso` … `nextweek`). Overrides the implicit `--queue-shift` bump for timeout jobs. |
+| `--skip-bad-files` | off | With `--recreate`, retroactively enable Coffea's skip-bad-files in the inner job by (re)materialising `inner_run_options.yaml` and patching the jobs_dir. |
 | `--remove-running` | off | With `--recreate`, `condor_rm` each recreated job's still-queued (running/idle) HTCondor instance before resubmitting, so a stuck job can't keep running and double-write its output. The instance is matched by the unique `config_job_<n>.pkl` in its lxplus `Args` ClassAd. |
 
 #### One-shot / proactive recreate
@@ -572,7 +572,7 @@ XRootD failure get a per-file alternate-site lookup, and any `--blocklist-sites`
 migrated to a non-blocklisted replica (falling back to the redirector if none is found).
 The rewritten fileset is written back into `config_job_{i}.pkl`; the original
 `jobs_config.yaml` is untouched. `--recreate-queue` rewrites the `+JobFlavour` of each
-`.sub` (overriding the implicit one-step bump applied to `.running` jobs).
+`.sub` (overriding the implicit one-step bump applied to `.timeout` jobs).
 
 Recreating a job that is still `.running`/`.idle` requires `--remove-running`. check-jobs
 uses the lxplus ClassAd constraint matching the unique `config_job_<n>.pkl` in its
