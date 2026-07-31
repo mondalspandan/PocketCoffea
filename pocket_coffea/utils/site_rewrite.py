@@ -26,6 +26,21 @@ XROOTD_FAILURE_STRINGS = (
 ROOT_URL_RE = re.compile(r"root://[^\s'\"<>]+?/store/[^\s'\",)]+")
 
 
+def normalize_rse(site):
+    """Use one CMS/Rucio name for disk and non-disk RSE variants."""
+    if isinstance(site, str) and site.endswith("_Disk"):
+        return site[:-5]
+    return site
+
+
+def _site_map_entry(site, sitemap):
+    normalized = normalize_rse(site)
+    for mapped_site, sitepath in sitemap.items():
+        if normalize_rse(mapped_site) == normalized and isinstance(sitepath, str):
+            return normalized, sitepath
+    return normalized, None
+
+
 def extract_failed_url(log_text):
     """Return the XRootD URL near the first known failure in a job .out log."""
     lines = log_text.splitlines()
@@ -59,7 +74,7 @@ def _site_of_url(filepath, sitemap):
         if not isinstance(sitepath, str):
             continue
         if rootpref in sitepath or sitepath in rootpref:
-            return site
+            return normalize_rse(site)
     return None
 
 
@@ -136,7 +151,7 @@ def find_other_file(filepath, sitemap, blocklist=None, exclude_urls=None,
     unchanged with a warning.
 
     Every site change is logged so the user can audit what was rewritten."""
-    blocklist = set(blocklist or [])
+    blocklist = {normalize_rse(site) for site in (blocklist or [])}
     exclude_urls = set(exclude_urls or [])
     rootpref, file = _split_lfn(filepath)
 
@@ -144,17 +159,15 @@ def find_other_file(filepath, sitemap, blocklist=None, exclude_urls=None,
         print(f"WARNING: cannot extract LFN from {filepath}; leaving unchanged.")
         return filepath
 
-    cur_site = _site_of_url(filepath, sitemap)
+    cur_site = normalize_rse(_site_of_url(filepath, sitemap))
     cur_site_str = cur_site or f"<unknown:{rootpref}>"
 
     sites = _query_replicas(file, client=rucio_client)
-    for site in sites:
-        if site in blocklist or site.replace("_Disk", "") in blocklist:
+    for raw_site in sites:
+        site, sitepath = _site_map_entry(raw_site, sitemap)
+        if site in blocklist:
             continue
-        if site not in sitemap:
-            continue
-        sitepath = sitemap[site]
-        if not isinstance(sitepath, str):
+        if sitepath is None:
             continue
         if rootpref in sitepath or sitepath in rootpref:
             continue
@@ -223,7 +236,7 @@ def rewrite_fileset_blocklist(fileset, sitemap, blocklist,
     A shared `rucio_client` is created lazily on the first lookup so that
     a single rewrite over many files reuses the same authenticated
     client."""
-    blocklist = set(blocklist or [])
+    blocklist = {normalize_rse(site) for site in (blocklist or [])}
     if not blocklist:
         return fileset
     new_fileset = deepcopy(fileset)

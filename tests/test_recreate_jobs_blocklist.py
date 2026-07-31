@@ -146,6 +146,19 @@ def test_find_other_file_picks_alt_site(das_sites):
     assert out == SITEC_PREFIX + "/store/data/foo.root"
 
 
+def test_disk_rse_names_normalize_for_blocklist_and_replica_lookup(das_sites):
+    f = SITEA_PREFIX + "/store/data/foo.root"
+    sitemap = {
+        "T2_X_SITEA_Disk": SITEA_PREFIX,
+        "T2_X_SITEC_Disk": SITEC_PREFIX,
+    }
+    das_sites["/store/data/foo.root"] = ["T2_X_SITEA_Disk", "T2_X_SITEC_Disk"]
+    out = ex.rewrite_fileset_blocklist(
+        _fileset([("sampleA", [f])]), sitemap, blocklist={"T2_X_SITEA"}
+    )
+    assert out["sampleA"]["files"] == [SITEC_PREFIX + "/store/data/foo.root"]
+
+
 # ----------------------- rewrite_fileset_to_redirector -----------------------
 
 def test_redirector_rewrites_all_files_no_rucio(das_sites):

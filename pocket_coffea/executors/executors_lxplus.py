@@ -249,6 +249,29 @@ JOBID="$1"
 MAX_XROOTD_REWRITES=10
 cleanup_started=0
 
+terminate_child_group() {{
+    if [[ -z "${{child:-}}" ]]; then
+        return
+    fi
+    if [[ -n "${{child_pgid:-}}" ]]; then
+        kill -TERM -- "-${{child_pgid}}" 2>/dev/null || true
+        for _ in {{1..50}}; do
+            if ! kill -0 -- "-${{child_pgid}}" 2>/dev/null; then
+                break
+            fi
+            sleep 0.1
+        done
+        if kill -0 -- "-${{child_pgid}}" 2>/dev/null; then
+            kill -KILL -- "-${{child_pgid}}" 2>/dev/null || true
+        fi
+    else
+        kill -TERM "$child" 2>/dev/null || true
+    fi
+    wait "$child" 2>/dev/null || true
+    child=""
+    child_pgid=""
+}}
+
 cleanup() {{
     trap - TERM INT
     if [ "$cleanup_started" -eq 1 ]; then
@@ -256,19 +279,7 @@ cleanup() {{
     fi
     cleanup_started=1
     echo "Termination signal received."
-    if [[ -n "${{child:-}}" ]]; then
-        kill -TERM "$child" 2>/dev/null || true
-        for _ in {{1..50}}; do
-            if ! kill -0 "$child" 2>/dev/null; then
-                break
-            fi
-            sleep 0.1
-        done
-        if kill -0 "$child" 2>/dev/null; then
-            kill -KILL "$child" 2>/dev/null || true
-        fi
-        wait "$child" 2>/dev/null || true
-    fi
+    terminate_child_group
     rm -f "$JOBDIR/job_$JOBID.running" "$JOBDIR/job_$JOBID.idle"
     touch "$JOBDIR/job_$JOBID.timeout"
     echo "Marked job as timeout."
@@ -280,11 +291,13 @@ trap cleanup TERM INT
 run_with_retries() {{
     local cmd="$*"
     for i in {{1..10}}; do
-        eval "$cmd" &
+        setsid bash -c "$cmd" &
         child=$!
+        child_pgid=$child
         wait "$child"
         command_status=$?
         child=""
+        child_pgid=""
         [ $command_status -eq 0 ] && return 0
         sleep 10
     done
@@ -311,11 +324,13 @@ failed_xrootd_sites="$_CONDOR_SCRATCH_DIR/failed_xrootd_sites.txt"
 while true; do
     attempt_log="$_CONDOR_SCRATCH_DIR/job_attempt_${{attempt}}.out"
     echo "Runner attempt $attempt"
-    {runnercmd} --cfg "$2" -o output "${{EXECUTOR_ARGS[@]}}" --chunksize "$3" --custom-run-options {inner_yaml_basename} > "$attempt_log" 2>&1 &
+    setsid {runnercmd} --cfg "$2" -o output "${{EXECUTOR_ARGS[@]}}" --chunksize "$3" --custom-run-options {inner_yaml_basename} > "$attempt_log" 2>&1 &
     child=$!
+    child_pgid=$child
     wait "$child"
     runner_status=$?
     child=""
+    child_pgid=""
     cat "$attempt_log"
     if [ $runner_status -eq 0 ]; then
         job_succeeded=1
@@ -325,11 +340,13 @@ while true; do
         echo "Reached the maximum number of XRootD recovery attempts ($MAX_XROOTD_REWRITES)."
         break
     fi
-    python -m pocket_coffea.scripts.rewrite_xrootd_site --config "$2" --log "$attempt_log" --failed-sites-file "$failed_xrootd_sites" &
+    setsid python -m pocket_coffea.scripts.rewrite_xrootd_site --config "$2" --log "$attempt_log" --failed-sites-file "$failed_xrootd_sites" &
     child=$!
+    child_pgid=$child
     wait "$child"
     rewrite_status=$?
     child=""
+    child_pgid=""
     if [ $rewrite_status -eq 0 ]; then
         echo "XRootD site rewrite changed the config. Rerunning job $JOBID."
         attempt=$((attempt + 1))

@@ -10,6 +10,7 @@ from pocket_coffea.utils.site_rewrite import (
     _split_lfn,
     extract_failed_url,
     find_other_file,
+    normalize_rse,
 )
 
 
@@ -28,7 +29,7 @@ def _load_failed_sites(path):
         return set()
     try:
         with open(path) as handle:
-            return {line.strip() for line in handle if line.strip()}
+            return {normalize_rse(line.strip()) for line in handle if line.strip()}
     except FileNotFoundError:
         return set()
 
@@ -37,7 +38,7 @@ def _save_failed_sites(path, failed_sites):
     if not path:
         return
     with open(path, "w") as handle:
-        for site in sorted(failed_sites):
+        for site in sorted({normalize_rse(site) for site in failed_sites}):
             handle.write(f"{site}\n")
 
 
@@ -47,7 +48,7 @@ def rewrite_files_from_failed_site(filesets, failed_url, sitemap, blocklist_site
     if failed_prefix is None:
         return deepcopy(filesets), 0, 0
 
-    blocklist_sites = set(blocklist_sites or [])
+    blocklist_sites = {normalize_rse(site) for site in (blocklist_sites or [])}
     new_filesets = deepcopy(filesets)
     ntarget = 0
     nchanged = 0

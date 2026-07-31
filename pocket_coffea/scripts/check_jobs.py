@@ -43,24 +43,16 @@ from pocket_coffea.utils.rucio import get_xrootd_sites_map, get_rucio_client
 from pocket_coffea.utils.site_rewrite import (
     extract_failed_url,
     find_other_file,
+    normalize_rse,
     rewrite_fileset_blocklist,
     rewrite_fileset_to_redirector,
     GLOBAL_XROOTD_REDIRECTOR,
 )
-from pocket_coffea.utils.htcondor_queue import bump_queue, set_queue
-
-queues = [
-    "espresso",
-    "microcentury",
-    "longlunch",
-    "workday",
-    "tomorrow",
-    "testmatch",
-    "nextweek"
-]
+from pocket_coffea.utils.htcondor_queue import QUEUES, bump_queue, set_queue
 
 LOCK_FILENAME = ".check_jobs.lock"
 JOB_MARKERS = ("idle", "running", "done", "failed", "timeout")
+CONDOR_REMOVAL_TIMEOUT = 10.0
 
 
 def _resolve_jobs_folder(jobs_folder):
@@ -323,6 +315,28 @@ def condor_job_constraint(job):
     return f'regexp("config_job_{idx}\\.pkl", Args)'
 
 
+def wait_for_condor_job_removal(job, timeout=CONDOR_REMOVAL_TIMEOUT, poll_interval=0.2):
+    """Wait until no lxplus job matching ``job`` remains in the queue."""
+    constraint = condor_job_constraint(job)
+    deadline = time.monotonic() + timeout
+    while True:
+        try:
+            result = subprocess.run(
+                ["condor_q", "-constraint", constraint, "-af", "ClusterId"],
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                check=False,
+            )
+        except OSError:
+            result = None
+        if result is not None and result.returncode == 0 and not result.stdout.strip():
+            return True
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(poll_interval)
+
+
 def condor_submit_job(jobs_folder, submit_file):
     try:
         result = subprocess.run(
@@ -351,9 +365,15 @@ def mark_job_idle(jobs_folder, job):
     (Path(jobs_folder) / f"{job}.idle").touch()
 
 
+def mark_job_failed(jobs_folder, job):
+    clear_job_markers(jobs_folder, job)
+    (Path(jobs_folder) / f"{job}.failed").touch()
+
+
 def recreate_jobs_oneshot(jobs_folder, jobs_to_recreate, *, use_redirector=False,
                           blocklist_sites=None, recreate_queue=None,
-                          skip_bad_files=False, queue_shift=1, remove_running=False,
+                          skip_bad_files=False, queue_shift=1, ncpu=1,
+                          remove_running=False,
                           dry_run=False):
     """One-shot recreate/resubmit of a chosen set of manual jobs.
 
@@ -378,8 +398,10 @@ def recreate_jobs_oneshot(jobs_folder, jobs_to_recreate, *, use_redirector=False
         return
     with open(jobs_config_path) as f:
         jobs_config = yaml.safe_load(f)
+    state_file = jobs_folder / "job_state.json"
+    job_state = load_job_state(state_file) if state_file.exists() else None
 
-    blocklist_sites = set(blocklist_sites or [])
+    blocklist_sites = {normalize_rse(site) for site in (blocklist_sites or [])}
     abs_jobdir = os.path.abspath(jobs_folder)
 
     # (Re)materialise the inner run-options YAML so a --skip-bad-files override
@@ -394,7 +416,13 @@ def recreate_jobs_oneshot(jobs_folder, jobs_to_recreate, *, use_redirector=False
             INNER_RUN_OPTIONS_FILENAME,
         )
         ensure_sub_transfers = ensure_sub_transfers_inner_yaml
-        write_inner_run_options(str(jobs_folder), {"skip-bad-files": True})
+        inner_options_path = Path(jobs_folder) / INNER_RUN_OPTIONS_FILENAME
+        existing_options = {}
+        if inner_options_path.exists():
+            with open(inner_options_path) as handle:
+                existing_options = yaml.safe_load(handle) or {}
+        existing_options["skip-bad-files"] = True
+        write_inner_run_options(str(jobs_folder), existing_options)
         if ensure_job_sh_forwards_inner_yaml(f"{jobs_folder}/job.sh"):
             rprint(f"[recreate] Patched {jobs_folder}/job.sh to forward "
                    f"{INNER_RUN_OPTIONS_FILENAME} to the inner pocket-coffea run.")
@@ -424,6 +452,7 @@ def recreate_jobs_oneshot(jobs_folder, jobs_to_recreate, *, use_redirector=False
         failedjobs = [j for j in jobs_to_redo if (jobs_folder / f"{j}.failed").exists()]
         runningjobs = [j for j in jobs_to_redo if (jobs_folder / f"{j}.running").exists()]
         idlejobs = [j for j in jobs_to_redo if (jobs_folder / f"{j}.idle").exists()]
+        timeoutjobs = [j for j in jobs_to_redo if (jobs_folder / f"{j}.timeout").exists()]
     rprint(f"Recreating jobs: {jobs_to_redo}")
 
     # Jobs that failed due to an XRootD error get a per-file alternate-site lookup.
@@ -454,9 +483,9 @@ def recreate_jobs_oneshot(jobs_folder, jobs_to_recreate, *, use_redirector=False
             rprint(f"[yellow]WARNING: could not open a rucio client ({e}); "
                    f"replica lookups will fail.[/]")
 
-    if recreate_queue is not None and recreate_queue not in queues:
+    if recreate_queue is not None and recreate_queue not in QUEUES:
         rprint(f"[yellow]WARNING: recreate-queue={recreate_queue!r} is not in the known "
-               f"HTCondor queue list {queues}; writing your value verbatim.[/]")
+               f"HTCondor queue list {QUEUES}; writing your value verbatim.[/]")
 
     for job in jobs_to_redo:
         if job not in jobs_config["jobs_list"]:
@@ -473,6 +502,9 @@ def recreate_jobs_oneshot(jobs_folder, jobs_to_recreate, *, use_redirector=False
             rprint(f"[recreate] condor_rm {job}: {output or 'no output'}")
             if not removed:
                 rprint(f"[red]Could not remove {job}; leaving markers and skipping resubmission.[/]")
+                continue
+            if not wait_for_condor_job_removal(job):
+                rprint(f"[red]Could not confirm removal of {job}; skipping resubmission.[/]")
                 continue
 
         # Source the ORIGINAL fileset from jobs_config.yaml (from-scratch) so
@@ -507,13 +539,17 @@ def recreate_jobs_oneshot(jobs_folder, jobs_to_recreate, *, use_redirector=False
         if skip_bad_files and ensure_sub_transfers is not None:
             ensure_sub_transfers(f"{jobs_folder}/{job}.sub", abs_jobdir)
 
-        # Explicit queue override wins over the implicit timeout bump.
+        # Explicit queue override wins over the implicit timeout queue bump,
+        # but timeout resource scaling still applies.
         selected_queue = None
+        if job in timeoutjobs:
+            selected_queue = escalate_timeout_job(
+                jobs_folder, job, job_state, state_file,
+                0 if recreate_queue is not None else queue_shift, ncpu,
+            )
         if recreate_queue is not None:
             set_queue(f"{jobs_folder}/{job}.sub", recreate_queue, job)
             selected_queue = recreate_queue
-        elif job in runningjobs:
-            selected_queue = bump_queue(f"{jobs_folder}/{job}.sub", queue_shift)
 
         if selected_queue is not None:
             sync_dynamic_queue(jobs_folder, job, selected_queue)
@@ -526,6 +562,7 @@ def recreate_jobs_oneshot(jobs_folder, jobs_to_recreate, *, use_redirector=False
             mark_job_idle(jobs_folder, job)
             rprint(f"[green]Resubmitted {job}: {output or 'submitted'}[/]")
         else:
+            mark_job_failed(jobs_folder, job)
             rprint(f"[red]Failed to resubmit {job}: {output or 'condor_submit failed'}[/]")
 
 
@@ -571,6 +608,50 @@ def scale_memory(memory, factor):
     return f"{value:g}{match.group(2)}"
 
 
+def update_job_submit_resources(sub_file, request_cpus, request_memory):
+    with open(sub_file) as handle:
+        lines = handle.readlines()
+    with open(sub_file, "w") as handle:
+        for line in lines:
+            stripped = line.strip()
+            if stripped.startswith("RequestCpus"):
+                line = f"RequestCpus = {request_cpus}\n"
+            elif stripped.startswith("RequestMemory"):
+                line = f"RequestMemory = {request_memory}\n"
+            elif stripped.startswith("arguments") and "$(CPUS)" not in line:
+                line = re.sub(r"\s+\d+\s*$", f" {request_cpus}\n", line)
+            handle.write(line)
+
+
+def scale_submit_resources(sub_file, factor):
+    with open(sub_file) as handle:
+        content = handle.read()
+    cpus_match = re.search(r"^RequestCpus\s*=\s*(\d+)\s*$", content, re.MULTILINE)
+    memory_match = re.search(r"^RequestMemory\s*=\s*(\S+)\s*$", content, re.MULTILINE)
+    if not cpus_match or not memory_match:
+        return False
+    update_job_submit_resources(
+        sub_file,
+        int(cpus_match.group(1)) * factor,
+        scale_memory(memory_match.group(1), factor),
+    )
+    return True
+
+
+def escalate_timeout_job(jobs_folder, job, job_state, state_file, queue_shift, ncpu):
+    job_num = job.split("_", 1)[1]
+    selected_queue = bump_jobqueue(job_num, job_state, state_file, queue_shift, ncpu)
+    if job_state is not None and job_num in job_state:
+        update_job_submit_resources(
+            f"{jobs_folder}/{job}.sub",
+            job_state[job_num]["request_cpus"],
+            job_state[job_num]["request_memory"],
+        )
+    elif selected_queue is not None:
+        scale_submit_resources(f"{jobs_folder}/{job}.sub", ncpu)
+    return selected_queue
+
+
 def bump_jobqueue(job_num, job_state=None, state_file=None, shift=1, ncpu=1):
     """Bump a dynamic job state, or a legacy per-job submit file.
 
@@ -583,7 +664,7 @@ def bump_jobqueue(job_num, job_state=None, state_file=None, shift=1, ncpu=1):
         return bump_queue(Path(state_file).parent / f"job_{job_num}.sub", shift)
     state = job_state[str(job_num)]
     current_queue = state["queue"]
-    state["queue"] = queues[min(queues.index(current_queue) + shift, len(queues) - 1)]
+    state["queue"] = QUEUES[min(QUEUES.index(current_queue) + shift, len(QUEUES) - 1)]
     if not state["resources_scaled"]:
         state["request_cpus"] = int(state["base_cpus"]) * ncpu
         state["request_memory"] = scale_memory(state["base_memory"], ncpu)
@@ -615,6 +696,7 @@ def submit_resubmit_jobs(jobs_folder, job_nums, job_state, state_file, log_text)
             submitted, output = condor_submit_job(jobs_folder, f"job_{job_num}.sub")
             log_text.append(output)
             if not submitted:
+                mark_job_failed(jobs_folder, f"job_{job_num}")
                 succeeded = False
                 continue
             mark_job_idle(jobs_folder, f"job_{job_num}")
@@ -647,6 +729,8 @@ def submit_resubmit_jobs(jobs_folder, job_nums, job_state, state_file, log_text)
         log_text.append(f"[red]Resubmitted {len(job_nums)} failed jobs to condor[/]")
     else:
         log_text.append(f"[red]Failed to resubmit {len(job_nums)} failed jobs to condor[/]")
+        for job_num in job_nums:
+            mark_job_failed(jobs_folder, f"job_{job_num}")
     return resubmit_succeeded
 
 
@@ -685,8 +769,6 @@ def convert_timeout_jobs(jobs_folder, timeout_jobs, running_jobs, idle_jobs, fai
 @click.option("-d","--details", is_flag=True, help="Show the details of the jobs")
 @click.option("-r","--resubmit", is_flag=True, help="Resubmit the failed jobs")
 @click.option("-m","--max-resubmit", type=int, help="Maximum number of resubmission", default=4)
-@click.option("-b", "--blacklist-threshold", type=int, default=3,
-              help="Retained compatibility threshold for XRootD site failures.")
 @click.option("-q","--queue-shift", type=int, help="How many queues to bump to if a job is removed due to time limit? E.g. 1 = bump to next queue, 2 = bump to next-to-next queue", default=1)
 @click.option("-n", "--ncpu", type=click.IntRange(min=1), default=1, show_default=True,
               help="CPU and memory multiplier applied once when a job's queue is shifted")
@@ -700,21 +782,37 @@ def convert_timeout_jobs(jobs_folder, timeout_jobs, running_jobs, idle_jobs, fai
 @click.option("--once", is_flag=True, default=False,
               help="Run one monitor/resubmit iteration and exit.")
 @click.option("--use-redirector", is_flag=True, default=False,
-              help="Use the global XRootD redirector for recreation or as retry fallback.")
+              help="With --recreate, rewrite files through the global XRootD redirector.")
 @click.option("--blocklist-sites", type=str, default=None,
-              help="Comma-separated CMS/Rucio site names to avoid (for example T2_CH_CERN).")
-@click.option("--recreate-queue", type=str, default=None,
-              help="Force recreated jobs to this HTCondor queue.")
+              help="With --recreate, comma-separated CMS/Rucio site names to avoid.")
+@click.option("--recreate-queue", type=click.Choice(QUEUES), default=None,
+              help="With --recreate, force jobs to this HTCondor queue.")
 @click.option("--skip-bad-files", is_flag=True, default=False,
-              help="Enable Coffea skip-bad-files for recreated jobs.")
+              help="With --recreate, enable Coffea skip-bad-files.")
 @click.option("--remove-running", is_flag=True, default=False,
-              help="Remove queued/running Condor instances before recreation.")
+              help="With --recreate, remove queued/running Condor instances first.")
 @_with_check_jobs_lock
-def check_jobs(jobs_folder, details, resubmit, max_resubmit, blacklist_threshold,
+def check_jobs(jobs_folder, details, resubmit, max_resubmit,
                queue_shift, ncpu,
                group_by, recreate, once, use_redirector, blocklist_sites,
                recreate_queue, skip_bad_files, remove_running):
     jobs_folder = _resolve_jobs_folder(jobs_folder)
+
+    recreate_only = []
+    if use_redirector:
+        recreate_only.append("--use-redirector")
+    if blocklist_sites:
+        recreate_only.append("--blocklist-sites")
+    if recreate_queue is not None:
+        recreate_only.append("--recreate-queue")
+    if skip_bad_files:
+        recreate_only.append("--skip-bad-files")
+    if remove_running:
+        recreate_only.append("--remove-running")
+    if recreate is None and recreate_only:
+        raise click.UsageError(
+            ", ".join(recreate_only) + " requires --recreate"
+        )
 
     explicit_blocklist = {
         site.strip() for site in blocklist_sites.split(",") if site.strip()
@@ -734,6 +832,7 @@ def check_jobs(jobs_folder, details, resubmit, max_resubmit, blacklist_threshold
             recreate_queue=recreate_queue,
             skip_bad_files=skip_bad_files,
             queue_shift=queue_shift,
+            ncpu=ncpu,
             remove_running=remove_running,
         )
         if not resubmit:

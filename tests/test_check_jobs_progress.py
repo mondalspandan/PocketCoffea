@@ -403,3 +403,28 @@ def test_out_parser_extracts_xrootd_failure():
 
     out = "OSError: XRootD error\nfile: root://T2.example//store/data/file.root\n"
     assert extract_failed_url(out) == "root://T2.example//store/data/file.root"
+
+
+@pytest.mark.parametrize("option", [
+    "--use-redirector", "--blocklist-sites", "--recreate-queue",
+    "--skip-bad-files", "--remove-running",
+])
+def test_recreate_only_options_are_rejected_in_monitor_mode(tmp_path, option):
+    from pocket_coffea.scripts.check_jobs import check_jobs
+
+    args = ["--jobs-folder", str(tmp_path), "--resubmit", "--by", "none", option]
+    if option == "--blocklist-sites":
+        args.append("T2_CH_CERN")
+    if option == "--recreate-queue":
+        args.append("workday")
+    result = CliRunner().invoke(check_jobs, args)
+    assert result.exit_code != 0
+    assert "requires --recreate" in result.output
+
+
+def test_blacklist_threshold_is_removed():
+    from pocket_coffea.scripts.check_jobs import check_jobs
+
+    result = CliRunner().invoke(check_jobs, ["--jobs-folder", "/tmp", "--blacklist-threshold", "2"])
+    assert result.exit_code != 0
+    assert "No such option" in result.output

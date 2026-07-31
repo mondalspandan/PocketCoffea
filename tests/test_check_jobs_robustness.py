@@ -30,7 +30,7 @@ def _ensure_rucio_importable():
 
 _ensure_rucio_importable()
 
-from pocket_coffea.scripts.check_jobs import bump_jobqueue, queues, set_queue  # noqa: E402
+from pocket_coffea.scripts.check_jobs import QUEUES, bump_jobqueue, set_queue  # noqa: E402
 
 
 def _write_sub(tmp_path, content):
@@ -53,7 +53,7 @@ def test_bump_caps_at_longest_queue(tmp_path):
 def test_bump_unknown_flavour_does_not_raise(tmp_path):
     # Previously raised ValueError from queues.index(jf).
     sub = _write_sub(tmp_path, '+JobFlavour="some_rubin_queue"\n')
-    assert bump_jobqueue(sub) == queues[-1]
+    assert bump_jobqueue(sub) == QUEUES[-1]
 
 
 def test_bump_without_jobflavour_returns_none(tmp_path):

@@ -149,7 +149,7 @@ def run(cfg,  custom_run_options, outputdir, test, limit_files,
     # silently ignoring them.
     _moved_flags = [k for k in ("recreate-jobs", "use-redirector", "recreate-queue", "blocklist-sites")
                     if k in run_options]
-    if _moved_flags:
+    if executor == "condor@lxplus" and _moved_flags:
         rprint(f"[red]ERROR:[/] the manual-job recreate options {_moved_flags} have moved to "
                f"[bold]pocket-coffea check-jobs[/].")
         rprint("Use e.g. [yellow]pocket-coffea check-jobs -j <outputdir>/job --recreate auto "
