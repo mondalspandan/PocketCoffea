@@ -278,8 +278,12 @@ terminate_child_group() {{
         group_gone=1
     fi
     wait "$child" 2>/dev/null || true
-    if [[ -n "${{child_pgid:-}}" ]] && kill -0 -- "-${{child_pgid}}" 2>/dev/null; then
-        group_gone=0
+    if [[ -n "${{child_pgid:-}}" ]]; then
+        if kill -0 -- "-${{child_pgid}}" 2>/dev/null; then
+            group_gone=0
+        else
+            group_gone=1
+        fi
     fi
     child=""
     child_pgid=""

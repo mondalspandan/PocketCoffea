@@ -239,6 +239,7 @@ class _ManualFactory(ExecutorFactoryManualABC):
 
     def recreate_jobs(self, jobs):
         self.recreated = jobs
+        self.recreate_attributes = (self.config, self.outputdir, self.filesets)
 
 
 def _manual_options(tmp_path, **extra):
@@ -268,3 +269,6 @@ def test_manual_factory_submit_dispatches_recreation(tmp_path):
     factory = _ManualFactory(_manual_options(tmp_path, **{"recreate-jobs": "0"}), str(tmp_path))
     factory.submit(object(), {}, str(tmp_path))
     assert factory.recreated == "0"
+    assert factory.recreate_attributes[0] is not None
+    assert factory.recreate_attributes[1] == str(tmp_path)
+    assert factory.recreate_attributes[2] == {}

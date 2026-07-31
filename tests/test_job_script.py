@@ -135,6 +135,7 @@ def test_timeout_cleanup_terminates_complete_local_process_group(tmp_path):
             break
         time.sleep(0.05)
     assert (tmp_path / "job_0.timeout").exists()
+    assert not (tmp_path / "job_0.failed").exists()
     for pid in recorded:
         with pytest.raises(ProcessLookupError):
             os.kill(pid, 0)

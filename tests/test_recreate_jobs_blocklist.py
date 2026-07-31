@@ -180,6 +180,8 @@ def test_exact_rse_prefix_is_used_for_unblocked_replica(das_sites):
     f = "root://other.example//store/data/foo.root"
     das_sites["/store/data/foo.root"] = ["T2_X_SITE_Disk"]
     assert ex.find_other_file(f, sitemap, blocklist=set()) == disk + "/store/data/foo.root"
+    das_sites["/store/data/foo.root"] = ["T2_X_SITE"]
+    assert ex.find_other_file(f, sitemap, blocklist=set()) == base + "/store/data/foo.root"
 
 
 # ----------------------- rewrite_fileset_to_redirector -----------------------

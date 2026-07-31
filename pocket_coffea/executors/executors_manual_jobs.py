@@ -177,14 +177,13 @@ class ExecutorFactoryManualABC(ABC):
 
 
     def submit(self, config, filesets, outputdir):
+        self.config = config
+        self.outputdir = outputdir
+        self.filesets = filesets
         jobs_to_recreate = self.run_options.get("recreate-jobs")
         if jobs_to_recreate:
             self.recreate_jobs(jobs_to_recreate)
             return
-        # storing the job config
-        self.config = config
-        self.outputdir = outputdir
-        self.filesets = filesets
         splits = self.prepare_splitting(filesets)
         # Save the per-job splits so submit_jobs can resolve per-job options
         # (per-sample chunksize, etc.) without re-reading jobs_config.yaml.
