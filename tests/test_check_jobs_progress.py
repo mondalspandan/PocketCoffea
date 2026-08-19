@@ -243,6 +243,22 @@ def test_stale_condor_abort_is_ignored_after_resubmission(tmp_path):
     assert not (tmp_path / "job_0.failed").exists()
 
 
+def test_same_second_condor_abort_is_current(tmp_path):
+    from pocket_coffea.scripts.check_jobs import recover_condor_log_failures
+
+    now = int(time.time())
+    marker = tmp_path / "job_0.running"
+    marker.touch()
+    os.utime(marker, (now + 0.5, now + 0.5))
+    logs = tmp_path / "logs"
+    logs.mkdir()
+    stamp = time.strftime("%m/%d %H:%M:%S", time.localtime(now))
+    (logs / "job_123.log").write_text(_condor_abort(0, stamp))
+
+    assert recover_condor_log_failures(tmp_path, {}) == 1
+    assert (tmp_path / "job_0.failed").exists()
+
+
 def test_resubmission_log_uses_filename_job_number(tmp_path):
     from pocket_coffea.scripts.check_jobs import recover_condor_log_failures
 

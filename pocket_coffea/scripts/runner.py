@@ -339,12 +339,12 @@ def run(cfg,  custom_run_options, outputdir, test, limit_files, limit_samples,
 
         output = run(filesets_to_run, treename="Events",
                      processor_instance=config.processor_instance)
-        
+        if timeit:
+            add_sample_processing_stats(timing_stats, output, filesets_to_run)
+        output.pop("processing_time", None)
         print(f"Saving output to {outfile.format('all')}")
         save(output, outfile.format("all") )
         print_processing_stats(output, start_time, run_options["scaleout"])
-        if timeit:
-            add_sample_processing_stats(timing_stats, output, filesets_to_run)
 
     else:
         if run_options["group-samples"] is not None:
@@ -418,11 +418,12 @@ def run(cfg,  custom_run_options, outputdir, test, limit_files, limit_samples,
                 failed_jobs_list.append(group_name)
                 continue
             else:
+                if timeit:
+                    add_sample_processing_stats(timing_stats, output, fileset_)
+                output.pop("processing_time", None)
                 print(f"Saving output to {outfile.format(group_name)}")
                 save(output, outfile.format(group_name))
                 print_processing_stats(output, dataset_start_time, run_options["scaleout"])
-                if timeit:
-                    add_sample_processing_stats(timing_stats, output, fileset_)
 
         # Save the list of failed jobs
         if len(failed_jobs_list) > 0:

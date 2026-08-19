@@ -116,9 +116,11 @@ Have a look below for more details about the available executor setups.
 The `iterative` and `futures` executors are available everywhere as they run locally (single thread and multi-processing
 respectively).
 
-Add `--timeit` to a bounded `iterative` or `futures` run to print throughput per
-dataset and save it next to the configuration as `timeit/<dataset>.json`.
-`condor@lxplus` also supports `--timeit` for bounded test/job-preparation runs.
+Add `--timeit` to an `iterative`, `futures`, or `condor@lxplus` run to print
+throughput per dataset and save it next to the configuration as
+`timeit/<dataset>.json`. It automatically selects enough files to approximate
+the configured chunksize; local executors process one chunk and Condor creates
+one job per selected dataset. It does not require `--test`, `-lf`, or `-lc`.
 Re-running refreshes the datasets processed in that run and keeps other saved files.
 
 

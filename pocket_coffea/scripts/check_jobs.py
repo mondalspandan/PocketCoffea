@@ -305,7 +305,7 @@ def recover_condor_log_failures(jobs_folder, log_offsets):
                      event_base + 365 * 24 * 3600),
                     key=lambda candidate: abs(candidate - marker_time),
                 )
-                if event_time >= marker_time and (
+                if event_time >= int(marker_time) and (
                         job not in recovered or event_time > recovered[job][0]):
                     recovered[job] = (event_time, reason)
             log_offsets[key] = handle.tell()
@@ -953,8 +953,6 @@ def check_jobs(jobs_folder, details, resubmit, max_resubmit,
             rprint(f"[red]{exc}[/]")
             raise SystemExit(1)
 
-    os.makedirs(f"{jobs_folder}/logs/processedlogs", exist_ok=True)
-    
     # Main loop
     show_progress = group_to_jobs is not None
     layout = create_layout(with_progress=show_progress)
