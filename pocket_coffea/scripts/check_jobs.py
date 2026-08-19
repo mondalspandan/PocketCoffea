@@ -252,6 +252,77 @@ def check_jobs_logs(jobs_folder):
     return idle_jobs, running_jobs, done_jobs, failed_jobs, timeout_jobs
 
 
+_CONDOR_ABORT_RE = re.compile(
+    r"^\s*009 \((\d+)\.(\d+)\.\d+\)\s+(\d\d/\d\d \d\d:\d\d:\d\d)"
+)
+
+
+def recover_condor_log_failures(jobs_folder, log_offsets):
+    """Recover current event-009 removals into the normal job markers."""
+    jobs_folder = Path(jobs_folder)
+    active = {}
+    for marker in ("idle", "running"):
+        for marker_path in jobs_folder.glob(f"job_*.{marker}"):
+            job = marker_path.name.rsplit(".", 1)[0]
+            if any((jobs_folder / f"{job}.{terminal}").exists()
+                   for terminal in ("done", "failed", "timeout")):
+                continue
+            active[job] = max(active.get(job, 0), marker_path.stat().st_mtime)
+
+    recovered = {}
+    for log_path in (jobs_folder / "logs").glob("job_*.log"):
+        key = str(log_path)
+        offset = log_offsets.get(key, 0)
+        if offset > log_path.stat().st_size:
+            offset = 0
+        with log_path.open(errors="replace") as handle:
+            handle.seek(offset)
+            while True:
+                line_start = handle.tell()
+                line = handle.readline()
+                if not line:
+                    break
+                match = _CONDOR_ABORT_RE.match(line)
+                if not match:
+                    continue
+                reason = handle.readline()
+                if not reason:
+                    handle.seek(line_start)
+                    break
+
+                stem_parts = log_path.stem.split(".", 1)
+                job = (f"job_{stem_parts[1]}" if len(stem_parts) == 2
+                       else f"job_{match.group(2)}")
+                if job not in active:
+                    continue
+                marker_time = active[job]
+                marker_year = time.localtime(marker_time).tm_year
+                event_base = time.mktime(time.strptime(
+                    f"{marker_year}/{match.group(3)}", "%Y/%m/%d %H:%M:%S"
+                ))
+                event_time = min(
+                    (event_base - 365 * 24 * 3600, event_base,
+                     event_base + 365 * 24 * 3600),
+                    key=lambda candidate: abs(candidate - marker_time),
+                )
+                if event_time >= marker_time and (
+                        job not in recovered or event_time > recovered[job][0]):
+                    recovered[job] = (event_time, reason)
+            log_offsets[key] = handle.tell()
+
+    for job, (_, reason) in recovered.items():
+        if any((jobs_folder / f"{job}.{terminal}").exists()
+               for terminal in ("done", "failed", "timeout")):
+            continue
+        clear_job_markers(jobs_folder, job)
+        marker = "timeout" if (
+            "SYSTEM_PERIODIC_REMOVE" in reason
+            and "wall time exceeded" in reason.lower()
+        ) else "failed"
+        (jobs_folder / f"{job}.{marker}").touch()
+    return len(recovered)
+
+
 def get_progress_table(group_counts, label, multi_sample_overlap=False, bar_width=30):
     """Build a rich Table showing per-group progress, sorted by % done
     ascending so straggling groups surface at the top. Includes a stacked
@@ -588,6 +659,9 @@ def sync_dynamic_queue(jobs_folder, job_name, queue, job_state=None, state_file=
     job_num = job_name.split("_", 1)[1]
     if job_num not in job_state:
         return False
+    sub_file = Path(jobs_folder) / f"{job_name}.sub"
+    if sub_file.exists():
+        set_queue(sub_file, queue, job_name)
     job_state[job_num]["queue"] = queue
     save_job_state(state_file, job_state)
     return True
@@ -675,15 +749,11 @@ def bump_jobqueue(job_num, job_state=None, state_file=None, shift=1, ncpu=1):
         state["request_cpus"] = int(state["base_cpus"]) * ncpu
         state["request_memory"] = scale_memory(state["base_memory"], ncpu)
         state["resources_scaled"] = True
+    sub_file = Path(state_file).parent / f"job_{job_num}.sub"
+    if sub_file.exists():
+        set_queue(sub_file, state["queue"], f"job_{job_num}")
     save_job_state(state_file, job_state)
     return state["queue"]
-
-
-def should_shift_for_refailure(job_num, job_state, job_name, shifted_jobs):
-    if job_state is None:
-        return job_name not in shifted_jobs
-    state = job_state.get(str(job_num), {})
-    return state.get("resubmissions", 0) >= 1 and job_name not in shifted_jobs
 
 
 def is_xrootd_exhaustion_log(out_text):
@@ -889,6 +959,8 @@ def check_jobs(jobs_folder, details, resubmit, max_resubmit,
     show_progress = group_to_jobs is not None
     layout = create_layout(with_progress=show_progress)
     log_text = []
+    condor_log_offsets = {}
+    recover_condor_log_failures(jobs_folder, condor_log_offsets)
     idle_jobs, running_jobs, done_jobs, failed_jobs, timeout_jobs = check_jobs_logs(jobs_folder)
     initially_shifted_jobs = set()
     convert_timeout_jobs(
@@ -912,6 +984,7 @@ def check_jobs(jobs_folder, details, resubmit, max_resubmit,
         try:
             while True:
                 step += 1
+                recover_condor_log_failures(jobs_folder, condor_log_offsets)
                 idle_jobs, running_jobs, done_jobs, failed_jobs, timeout_jobs = check_jobs_logs(jobs_folder)
                 shifted_jobs = initially_shifted_jobs
                 initially_shifted_jobs = set()
@@ -951,6 +1024,10 @@ def check_jobs(jobs_folder, details, resubmit, max_resubmit,
                                 out_text = "".join(c)
                                 log_text.append( f"[b]Job {failed_job} failed[/] {failed_jobs_stats[failed_job]} times. Last output:")
                                 log_text.append("\t"+ "".join(c[-3:]))
+                                if "Corrupt input data" in out_text:
+                                    log_text.append(
+                                        f"[yellow]{failed_job} reported corrupt input data in its .out log.[/]"
+                                    )
                             else:
                                 log_text.append( f"Error in job {failed_job}: No .out file found")
 
@@ -961,17 +1038,6 @@ def check_jobs(jobs_folder, details, resubmit, max_resubmit,
                                     log_text.append(
                                         f"{failed_job} exhausted XRootD recovery. "
                                         "Resubmitting the original AFS config without queue changes."
-                                    )
-                                if (not xrootd_exhausted) and should_shift_for_refailure(
-                                        failed_job_num, job_state, failed_job, shifted_jobs):
-                                    next_jf = bump_jobqueue(
-                                        failed_job_num, job_state, state_file,
-                                        queue_shift, ncpu,
-                                    )
-                                    shifted_jobs.add(failed_job)
-                                    log_text.append(
-                                        f"{failed_job} failed again. Bumped to longer "
-                                        f"condor queue: {next_jf}."
                                     )
                                 resubmit_now.append(failed_job_num)
                             else:

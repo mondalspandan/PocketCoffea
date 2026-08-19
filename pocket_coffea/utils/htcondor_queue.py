@@ -26,6 +26,24 @@ QUEUES = [
     "nextweek",
 ]
 
+QUEUE_SECONDS = {
+    "espresso": 20 * 60,
+    "microcentury": 60 * 60,
+    "longlunch": 2 * 60 * 60,
+    "workday": 8 * 60 * 60,
+    "tomorrow": 24 * 60 * 60,
+    "testmatch": 3 * 24 * 60 * 60,
+    "nextweek": 7 * 24 * 60 * 60,
+}
+
+
+def queue_for_runtime(seconds, threshold_percent):
+    limit = float(threshold_percent) / 100
+    return next(
+        (queue for queue in QUEUES if seconds < QUEUE_SECONDS[queue] * limit),
+        QUEUES[-1],
+    )
+
 
 def _read_flavour(line):
     """Extract the flavour value from a ``+JobFlavour`` line, tolerating both
@@ -78,8 +96,6 @@ def set_queue(sub_file, new_queue, job=None):
             if "+JobFlavour" in line:
                 old = _read_flavour(line)
                 if old != new_queue:
-                    label = f"{job}: " if job else ""
-                    print(f"[queue] {label}{old} -> {new_queue}")
                     changed = True
                 f.write(f'+JobFlavour="{new_queue}"\n')
             else:

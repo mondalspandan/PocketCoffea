@@ -9,6 +9,7 @@ here directly from check_jobs.py.
 """
 import os
 import json
+import time
 
 import pytest
 from click.testing import CliRunner
@@ -22,11 +23,12 @@ from pocket_coffea.utils.job_progress import (
 def test_condor_job_state_preserves_per_job_chunksizes():
     from pocket_coffea.executors.executors_lxplus import build_condor_job_state
 
-    state = build_condor_job_state([100, 250], "espresso", 2, "4GB")
+    state = build_condor_job_state([100, 250], ["espresso", "workday"], 2, "4GB")
 
     assert state["0"]["chunksize"] == 100
     assert state["1"]["chunksize"] == 250
     assert state["0"]["queue"] == "espresso"
+    assert state["1"]["queue"] == "workday"
     assert state["0"]["base_cpus"] == state["0"]["request_cpus"] == 2
     assert state["0"]["base_memory"] == state["0"]["request_memory"] == "4GB"
 
@@ -181,6 +183,143 @@ def test_check_jobs_logs_reports_timeout_marker(tmp_path):
     assert timeout == ["job_0"]
 
 
+def _condor_abort(proc_id, stamp, reason="Job removed by user."):
+    return (
+        f"009 (123.{proc_id}.000) {stamp} Job was aborted.\n"
+        f"{reason}\n"
+    )
+
+
+def _prepare_condor_log(tmp_path, content=""):
+    logs = tmp_path / "logs"
+    logs.mkdir()
+    (tmp_path / "job_0.running").touch()
+    log = logs / "job_123.log"
+    log.write_text(content)
+    return log
+
+
+def test_condor_log_walltime_abort_becomes_timeout(tmp_path):
+    from pocket_coffea.scripts.check_jobs import recover_condor_log_failures
+
+    marker = tmp_path / "job_0.running"
+    marker.touch()
+    os.utime(marker, (time.time() - 10, time.time() - 10))
+    stamp = time.strftime("%m/%d %H:%M:%S", time.localtime(time.time() + 2))
+    _prepare_condor_log(tmp_path, _condor_abort(
+        0, stamp,
+        "Job removed by SYSTEM_PERIODIC_REMOVE due to wall time exceeded allowed max.",
+    ))
+
+    assert recover_condor_log_failures(tmp_path, {}) == 1
+    assert (tmp_path / "job_0.timeout").exists()
+
+
+def test_condor_log_nonwalltime_abort_becomes_failed(tmp_path):
+    from pocket_coffea.scripts.check_jobs import recover_condor_log_failures
+
+    marker = tmp_path / "job_0.running"
+    marker.touch()
+    os.utime(marker, (time.time() - 10, time.time() - 10))
+    stamp = time.strftime("%m/%d %H:%M:%S", time.localtime(time.time() + 2))
+    _prepare_condor_log(tmp_path, _condor_abort(0, stamp))
+
+    assert recover_condor_log_failures(tmp_path, {}) == 1
+    assert (tmp_path / "job_0.failed").exists()
+    assert not (tmp_path / "job_0.timeout").exists()
+
+
+def test_stale_condor_abort_is_ignored_after_resubmission(tmp_path):
+    from pocket_coffea.scripts.check_jobs import recover_condor_log_failures
+
+    log = _prepare_condor_log(tmp_path)
+    old_stamp = time.strftime("%m/%d %H:%M:%S", time.localtime(time.time() - 3600))
+    log.write_text(_condor_abort(0, old_stamp))
+    marker = tmp_path / "job_0.running"
+    os.utime(marker, (time.time(), time.time()))
+
+    assert recover_condor_log_failures(tmp_path, {}) == 0
+    assert marker.exists()
+    assert not (tmp_path / "job_0.failed").exists()
+
+
+def test_resubmission_log_uses_filename_job_number(tmp_path):
+    from pocket_coffea.scripts.check_jobs import recover_condor_log_failures
+
+    marker = tmp_path / "job_7.idle"
+    marker.touch()
+    os.utime(marker, (time.time() - 10, time.time() - 10))
+    logs = tmp_path / "logs"
+    logs.mkdir()
+    stamp = time.strftime("%m/%d %H:%M:%S", time.localtime(time.time() + 2))
+    (logs / "job_456.7.log").write_text(_condor_abort(0, stamp))
+
+    assert recover_condor_log_failures(tmp_path, {}) == 1
+    assert (tmp_path / "job_7.failed").exists()
+    assert not (tmp_path / "job_0.failed").exists()
+
+
+def test_terminal_job_is_not_downgraded_by_condor_abort(tmp_path):
+    from pocket_coffea.scripts.check_jobs import recover_condor_log_failures
+
+    marker = tmp_path / "job_0.running"
+    marker.touch()
+    (tmp_path / "job_0.done").touch()
+    logs = tmp_path / "logs"
+    logs.mkdir()
+    stamp = time.strftime("%m/%d %H:%M:%S", time.localtime(time.time() + 2))
+    (logs / "job_123.log").write_text(_condor_abort(0, stamp))
+
+    assert recover_condor_log_failures(tmp_path, {}) == 0
+    assert (tmp_path / "job_0.done").exists()
+    assert not (tmp_path / "job_0.failed").exists()
+
+
+def test_condor_log_scanner_is_incremental_and_detects_appends(tmp_path):
+    from pocket_coffea.scripts.check_jobs import recover_condor_log_failures
+
+    marker = tmp_path / "job_0.running"
+    marker.touch()
+    os.utime(marker, (time.time() - 10, time.time() - 10))
+    logs = tmp_path / "logs"
+    logs.mkdir()
+    log = logs / "job_123.log"
+    stamp = time.strftime("%m/%d %H:%M:%S", time.localtime(time.time() + 2))
+    log.write_text(_condor_abort(0, stamp))
+    offsets = {}
+
+    assert recover_condor_log_failures(tmp_path, offsets) == 1
+    assert recover_condor_log_failures(tmp_path, offsets) == 0
+
+    marker = tmp_path / "job_0.running"
+    (tmp_path / "job_0.failed").unlink()
+    marker.touch()
+    os.utime(marker, (time.time() - 10, time.time() - 10))
+    log.write_text(log.read_text() + _condor_abort(0, stamp))
+    assert recover_condor_log_failures(tmp_path, offsets) == 1
+
+
+def test_condor_log_scanner_waits_for_reason_line(tmp_path):
+    from pocket_coffea.scripts.check_jobs import recover_condor_log_failures
+
+    marker = tmp_path / "job_0.running"
+    marker.touch()
+    os.utime(marker, (time.time() - 10, time.time() - 10))
+    logs = tmp_path / "logs"
+    logs.mkdir()
+    log = logs / "job_123.log"
+    stamp = time.strftime("%m/%d %H:%M:%S", time.localtime(time.time() + 2))
+    event = f"009 (123.0.000) {stamp} Job was aborted.\n"
+    log.write_text(event)
+    offsets = {}
+
+    assert recover_condor_log_failures(tmp_path, offsets) == 0
+    assert offsets[str(log)] == 0
+    log.write_text(event + "Job removed by user.\n")
+    assert recover_condor_log_failures(tmp_path, offsets) == 1
+    assert (tmp_path / "job_0.failed").exists()
+
+
 def test_convert_timeout_jobs_bumps_queue_and_marks_failed(tmp_path):
     from pocket_coffea.scripts.check_jobs import convert_timeout_jobs
 
@@ -251,16 +390,25 @@ def test_bump_jobqueue_scales_resources_only_once(tmp_path):
     assert job_state["1"]["request_memory"] == "4GB"
 
 
-def test_ordinary_refailure_shifts_only_after_first_resubmission():
-    from pocket_coffea.scripts.check_jobs import should_shift_for_refailure
+def test_bump_jobqueue_updates_concrete_submit_queue(tmp_path):
+    from pocket_coffea.scripts.check_jobs import bump_jobqueue
 
-    job_state = {"0": {"resubmissions": 0}}
-    assert not should_shift_for_refailure("0", job_state, "job_0", set())
+    state_file = tmp_path / "job_state.json"
+    sub_file = tmp_path / "job_0.sub"
+    sub_file.write_text('+JobFlavour="espresso"\nqueue\n')
+    job_state = {
+        "0": {
+            "queue": "espresso",
+            "base_cpus": 1,
+            "base_memory": "4GB",
+            "request_cpus": 1,
+            "request_memory": "4GB",
+            "resources_scaled": False,
+        }
+    }
 
-    job_state["0"]["resubmissions"] = 1
-    assert should_shift_for_refailure("0", job_state, "job_0", set())
-    assert not should_shift_for_refailure("0", job_state, "job_0", {"job_0"})
-    assert not should_shift_for_refailure("999", job_state, "job_999", set())
+    assert bump_jobqueue("0", job_state, state_file) == "microcentury"
+    assert '+JobFlavour="microcentury"' in sub_file.read_text()
 
 
 def test_xrootd_exhaustion_log_is_detected():
@@ -339,9 +487,11 @@ def test_recreate_queue_synchronizes_dynamic_state(tmp_path):
 
     state_file = tmp_path / "job_state.json"
     state_file.write_text(json.dumps({"0": {"queue": "espresso"}}))
+    (tmp_path / "job_0.sub").write_text('+JobFlavour="espresso"\nqueue\n')
 
     assert sync_dynamic_queue(tmp_path, "job_0", "workday")
     assert json.loads(state_file.read_text())["0"]["queue"] == "workday"
+    assert '+JobFlavour="workday"' in (tmp_path / "job_0.sub").read_text()
 
 
 def test_recreate_queue_sync_is_legacy_safe(tmp_path):

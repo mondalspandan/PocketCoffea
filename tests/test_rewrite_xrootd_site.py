@@ -49,7 +49,7 @@ def _patch_rewrite_deps(monkeypatch):
     monkeypatch.setattr(helper, "find_other_file", fake_find_other_file)
 
 
-def test_no_xrootd_string_returns_no_xrootd_and_preserves_config(tmp_path, monkeypatch):
+def test_no_xrootd_string_returns_no_xrootd_and_preserves_config(tmp_path, monkeypatch, capsys):
     _patch_rewrite_deps(monkeypatch)
     filesets = _fileset([("sampleA", [SITEA_PREFIX + "/store/data/a.root"])])
     config_path = _dump_config(tmp_path, filesets)
@@ -57,8 +57,10 @@ def test_no_xrootd_string_returns_no_xrootd_and_preserves_config(tmp_path, monke
     log_path.write_text("ValueError: something unrelated\n")
 
     rc = helper.rewrite_config_from_log(config_path, log_path)
+    output = capsys.readouterr().out
 
     assert rc == helper.EXIT_NO_XROOTD
+    assert output == ""
     assert _load_filesets(config_path)["sampleA"]["files"] == filesets["sampleA"]["files"]
 
 

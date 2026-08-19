@@ -38,7 +38,7 @@ _ensure_rucio_importable()
 from pocket_coffea.executors.executors_lxplus import build_job_script  # noqa: E402
 
 
-def _script(split_by_category=False, cores=1):
+def _script(split_by_category=False, cores=1, timeit=False):
     return build_job_script(
         env_extras="export FOO=bar",
         abs_jobdir_path="/abs/jobs",
@@ -48,6 +48,9 @@ def _script(split_by_category=False, cores=1):
         inner_yaml_basename="inner.yaml",
         split_by_category=split_by_category,
         cores_per_worker=cores,
+        timeit=timeit,
+        timeit_dir="/shared/timeit",
+        timeit_copy_command="cp -f",
     )
 
 
@@ -93,6 +96,15 @@ def test_split_by_category_runs_in_output_and_is_exit_checked():
     # Runtime CPU argument selects futures and carries the same scaleout value.
     assert 'EXECUTOR_ARGS=(--executor futures --scaleout "$4")' in script
     assert '"${EXECUTOR_ARGS[@]}"' in script
+
+
+def test_timeit_forwards_worker_flag_and_copies_json_with_overwrite():
+    script = _script(timeit=True)
+    assert "--timeit --_timeit-worker" in script
+    assert 'mkdir -p timeit' in script
+    assert 'timeit/*.json' in script
+    assert 'cp -f' in script
+    assert '/shared/timeit/' in script
 
 
 def test_timeout_cleanup_terminates_complete_local_process_group(tmp_path):

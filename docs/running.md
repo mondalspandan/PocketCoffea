@@ -116,6 +116,11 @@ Have a look below for more details about the available executor setups.
 The `iterative` and `futures` executors are available everywhere as they run locally (single thread and multi-processing
 respectively).
 
+Add `--timeit` to a bounded `iterative` or `futures` run to print throughput per
+dataset and save it next to the configuration as `timeit/<dataset>.json`.
+`condor@lxplus` also supports `--timeit` for bounded test/job-preparation runs.
+Re-running refreshes the datasets processed in that run and keeps other saved files.
+
 
 | Site | Supported executor | Executor string|
 |------|--------------------|----------------|
@@ -383,6 +388,11 @@ You **must** provide either `--scaleout` or `max-events-per-job` — otherwise t
 splitting will produce a single job. The HTCondor `+JobFlavour` queues from shortest to
 longest are `espresso`, `microcentury`, `longlunch`, `workday`, `tomorrow`, `testmatch`,
 `nextweek`.
+
+When a matching `timeit/*.json` directory exists and only `--scaleout` is given,
+manual-job executors automatically give faster datasets more events per job and
+slower datasets more jobs. Datasets absent from the directory use its median rate.
+An explicit `max-events-per-job` always takes precedence.
 
 ##### Per-sample `max-events-per-job`
 

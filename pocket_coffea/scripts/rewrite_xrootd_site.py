@@ -74,7 +74,6 @@ def rewrite_config_from_log(config_file, log_file, failed_sites_file=None):
     with open(log_file) as handle:
         failed_url = extract_failed_url(handle.read())
     if failed_url is None:
-        print("No XRootD failure URL found in .out log.")
         return EXIT_NO_XROOTD
 
     config = cloudpickle.load(open(config_file, "rb"))

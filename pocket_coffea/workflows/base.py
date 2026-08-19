@@ -105,6 +105,7 @@ class BaseProcessorABC(processor.ProcessorABC, ABC):
                 for v, vcfg in self.cfg.variables.items()
                 if vcfg.metadata_hist
             },
+            "processing_time": {},
             "datasets_metadata":{ } #year:sample:subsample
         }
 
@@ -673,6 +674,10 @@ class BaseProcessorABC(processor.ProcessorABC, ABC):
                     self.output["processing_metadata"][f"throughput_per_chunk_{k}"][
                         self._sample][self._dataset] = hepc.hist_obj
 
+    def save_processing_time(self):
+        self.stop_time = time.perf_counter()
+        self.output["processing_time"][self._dataset] = self.stop_time - self.start_time
+
 
     def initialize_calibrators(self):
         '''Creates the calibator manager and initialize all the calibrators.
@@ -782,7 +787,7 @@ class BaseProcessorABC(processor.ProcessorABC, ABC):
           - define histograms
           - count events in each category
         '''
-        self.start_time = time.time()
+        self.start_time = time.perf_counter()
         self.events = events
         # Define the accumulator instance for this chunk
         self.output = copy.deepcopy(self.output_format)
@@ -818,6 +823,7 @@ class BaseProcessorABC(processor.ProcessorABC, ABC):
         # MET filter, lumimask, + custom skimming function
         self.skim_events()
         if not self.has_events:
+            self.save_processing_time()
             return self.output
 
         skim_mode = self.workflow_options.get("skim_mode", "skim") if self.workflow_options else "skim"
@@ -829,6 +835,7 @@ class BaseProcessorABC(processor.ProcessorABC, ABC):
                 f"(skim cuts on raw NanoAOD, no calibration / no preselection)."
             )
             self.export_skimmed_chunk()
+            self.save_processing_time()
             return self.output
 
         # --- Systematic-aware skimming logic
@@ -867,9 +874,11 @@ class BaseProcessorABC(processor.ProcessorABC, ABC):
             )
 
             if not self.has_events:
+                self.save_processing_time()
                 return self.output
 
             self.export_skimmed_chunk()
+            self.save_processing_time()
             return self.output
         # --------------------------
 
@@ -948,7 +957,7 @@ class BaseProcessorABC(processor.ProcessorABC, ABC):
             # Count events
             self.count_events(variation)
 
-        self.stop_time = time.time()
+        self.save_processing_time()
         self.save_processing_metadata()
         return self.output
 

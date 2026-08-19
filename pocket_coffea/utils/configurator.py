@@ -7,6 +7,7 @@ import cloudpickle
 from collections import defaultdict
 import inspect
 import logging
+from math import ceil
 from omegaconf import OmegaConf
 from warnings import warn
 
@@ -748,6 +749,38 @@ class Configurator:
                     orig = meta["nevents"]
                     scaled = int(int(orig) * len(ds["files"]) / n_total_files)
                     meta["nevents"] = str(scaled) if isinstance(orig, str) else scaled
+                except (ValueError, TypeError):
+                    pass
+            filtered_filesets[dataset_name] = ds
+            filtered_datasets.append(dataset_name)
+        self.filesets = filtered_filesets
+        self.datasets = filtered_datasets
+
+    def filter_dataset_by_events(self, target_events):
+        target_events = int(target_events)
+        if target_events <= 0:
+            raise ValueError("target_events must be positive")
+
+        filtered_filesets = {}
+        filtered_datasets = []
+        for dataset_name, ds in self.filesets.items():
+            files = ds.get("files", [])
+            metadata = ds.get("metadata", {})
+            n_total_files = len(files)
+            try:
+                total_events = int(metadata["nevents"])
+                mean_events_per_file = total_events / n_total_files
+                nfiles = min(n_total_files, max(1, ceil(target_events / mean_events_per_file)))
+            except (KeyError, TypeError, ValueError, ZeroDivisionError):
+                warn(f"Could not estimate events per file for {dataset_name}; keeping all files")
+                nfiles = n_total_files
+
+            ds["files"] = files[:nfiles]
+            if metadata is not None and "nevents" in metadata and n_total_files > 0:
+                try:
+                    orig = metadata["nevents"]
+                    scaled = int(int(orig) * len(ds["files"]) / n_total_files)
+                    metadata["nevents"] = str(scaled) if isinstance(orig, str) else scaled
                 except (ValueError, TypeError):
                     pass
             filtered_filesets[dataset_name] = ds

@@ -2,7 +2,9 @@ import os
 import yaml
 from abc import ABC, abstractmethod
 from collections.abc import Mapping
+from statistics import median
 from coffea import processor as coffea_processor
+from pocket_coffea.utils.benchmarking import load_sample_throughputs
 from pocket_coffea.utils.network import get_proxy_path
 from rich import print
 from rich.table import Table
@@ -208,7 +210,25 @@ class ExecutorFactoryManualABC(ABC):
            derived as `tot_n_events // scaleout`.
         '''
         tot_n_events = sum([int(fileset["metadata"]["nevents"]) for fileset in filesets.values()])
+        if self.run_options.get("timeit", False):
+            jobs = [{dataset: fileset} for dataset, fileset in filesets.items()]
+            nfiles_jobs = [int(job[dataset]["metadata"]["nevents"])
+                           for job in jobs for dataset in job]
+            print(f"[timeit] One job per dataset: {len(jobs)} job(s)")
+            self._print_jobs_table(jobs, nfiles_jobs, tot_n_events)
+            return jobs
+
         max_events_per_job = self.run_options.get("max-events-per-job", None)
+
+        if max_events_per_job is None and (timeit_path := self.run_options.get("_timeit-dir")):
+            throughputs = load_sample_throughputs(timeit_path)
+            if throughputs:
+                target_jobs = self._adaptive_job_targets(
+                    filesets, throughputs, self.run_options.get("scaleout")
+                )
+                jobs, nfiles_jobs = self._split_per_dataset(filesets, target_jobs)
+                self._print_jobs_table(jobs, nfiles_jobs, tot_n_events)
+                return jobs
 
         # Accept both plain dict and OmegaConf DictConfig (from --custom-run-options YAML).
         if isinstance(max_events_per_job, Mapping):
@@ -227,6 +247,37 @@ class ExecutorFactoryManualABC(ABC):
 
         self._print_jobs_table(jobs, nfiles_jobs, tot_n_events)
         return jobs
+
+    @staticmethod
+    def _adaptive_job_targets(filesets, throughputs, scaleout):
+        scaleout = int(scaleout)
+        if scaleout <= 0:
+            raise ValueError("scaleout must be positive")
+
+        events = {
+            dataset: int(fileset["metadata"]["nevents"])
+            for dataset, fileset in filesets.items()
+        }
+
+        fallback = median(throughputs.values())
+        missing = sorted(set(events) - set(throughputs))
+        if missing:
+            print(f"[adaptive-splitting] Missing throughput for datasets {missing}; using median {fallback:.2f} events/s")
+        rates = {dataset: throughputs.get(dataset, fallback) for dataset in events}
+        target_seconds = sum(events[dataset] / rates[dataset] for dataset in events) / scaleout
+        print(f"[adaptive-splitting] Targeting {scaleout} jobs at about {target_seconds:.1f} s/job")
+        requested = {
+            dataset: ceil(events[dataset] / (rates[dataset] * target_seconds))
+            for dataset in events
+        }
+        targets = {
+            dataset: min(max(1, requested[dataset]), len(filesets[dataset]["files"]))
+            for dataset in events
+        }
+        for dataset in events:
+            print(f"[adaptive-splitting] {dataset}: requested {requested[dataset]} job(s), "
+                  f"using {targets[dataset]} (files={len(filesets[dataset]['files'])})")
+        return targets
 
     @staticmethod
     def _split_uniform(filesets, max_events_per_job):
@@ -267,16 +318,38 @@ class ExecutorFactoryManualABC(ABC):
         return jobs, nfiles_jobs
 
     @staticmethod
-    def _split_per_sample(filesets, max_events_per_job_by_sample):
+    def _split_per_dataset(filesets, target_jobs):
+        '''Split each dataset into its assigned number of contiguous file groups.'''
+        jobs = []
+        nfiles_jobs = []
+        for dataset_name, fileset in filesets.items():
+            files = fileset["files"]
+            n_jobs = min(max(1, int(target_jobs[dataset_name])), len(files))
+            files_per_job, remainder = divmod(len(files), n_jobs)
+            nevents_per_file = ceil(int(fileset["metadata"]["nevents"]) / len(files))
+            start = 0
+            for job_index in range(n_jobs):
+                stop = start + files_per_job + (job_index < remainder)
+                job_files = files[start:stop]
+                jobs.append({
+                    dataset_name: {"files": job_files, "metadata": fileset["metadata"]}
+                })
+                nfiles_jobs.append(nevents_per_file * len(job_files))
+                start = stop
+        return jobs, nfiles_jobs
+
+    @staticmethod
+    def _split_per_sample(filesets, max_events_per_job_by_sample, dataset_keys=False):
         '''Per-sample splitting: each dataset is split independently using its
         sample-specific events-per-job budget. Output jobs contain files from
         exactly one dataset.'''
         default_limit = max_events_per_job_by_sample.get("default", None)
         known_keys = {k for k in max_events_per_job_by_sample if k != "default"}
 
-        # Discover the samples actually present in this fileset to surface typos early.
+        # Accept exact dataset keys and legacy metadata sample keys.
+        datasets_present = set(filesets)
         samples_present = {fs["metadata"]["sample"] for fs in filesets.values()}
-        unknown_keys = known_keys - samples_present
+        unknown_keys = known_keys - datasets_present - samples_present
         if unknown_keys:
             print(f"[max-events-per-job] WARNING: dict keys {sorted(unknown_keys)} do not match any sample in the current fileset. "
                   f"Samples present: {sorted(samples_present)}. These keys will be ignored.")
@@ -285,10 +358,14 @@ class ExecutorFactoryManualABC(ABC):
         nfiles_jobs = []
         for dataset_name, fileset in filesets.items():
             sample = fileset["metadata"]["sample"]
-            limit = max_events_per_job_by_sample.get(sample, default_limit)
+            if dataset_keys:
+                limit = max_events_per_job_by_sample.get(dataset_name, default_limit)
+            else:
+                limit = max_events_per_job_by_sample.get(dataset_name,
+                                                         max_events_per_job_by_sample.get(sample, default_limit))
             if limit is None:
                 raise Exception(
-                    f"max-events-per-job dict has no entry for sample {sample!r} (dataset {dataset_name!r}) "
+                    f"max-events-per-job dict has no entry for dataset {dataset_name!r} "
                     f"and no 'default' fallback. Provide one or the other."
                 )
             limit = int(limit)

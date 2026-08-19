@@ -16,7 +16,10 @@ import cloudpickle
 import yaml
 import json
 import multiprocessing as mp
+from statistics import median
+import click
 from rich.console import Console
+from rich.table import Table
 from rich.progress import (
     BarColumn,
     Progress,
@@ -24,6 +27,11 @@ from rich.progress import (
     TextColumn,
     TimeElapsedColumn,
     TimeRemainingColumn,
+)
+from pocket_coffea.utils.benchmarking import load_sample_throughputs
+from pocket_coffea.utils.htcondor_queue import (
+    QUEUE_SECONDS,
+    queue_for_runtime,
 )
 
 _PREPARE_CFG = None
@@ -68,7 +76,11 @@ def build_condor_shutdown_policy():
     }
 
 
-def build_condor_job_state(per_job_chunksize, queue, cpus, memory):
+def build_condor_job_state(per_job_chunksize, per_job_queue, cpus, memory):
+    if isinstance(per_job_queue, str):
+        per_job_queue = [per_job_queue] * len(per_job_chunksize)
+    if len(per_job_queue) != len(per_job_chunksize):
+        raise ValueError("per_job_chunksize and per_job_queue must have the same length")
     return {
         str(i): {
             "queue": queue,
@@ -80,7 +92,7 @@ def build_condor_job_state(per_job_chunksize, queue, cpus, memory):
             "resources_scaled": False,
             "resubmissions": 0,
         }
-        for i, chunksize in enumerate(per_job_chunksize)
+        for i, (chunksize, queue) in enumerate(zip(per_job_chunksize, per_job_queue))
     }
 
 
@@ -215,6 +227,9 @@ def build_job_script(
     inner_yaml_basename,
     split_by_category,
     cores_per_worker,
+    timeit=False,
+    timeit_dir=None,
+    timeit_copy_command=None,
 ):
     '''Build the per-job HTCondor wrapper (job.sh) as a string.
 
@@ -240,6 +255,10 @@ def build_job_script(
 '''
     else:
         splitcommands = f'run_with_retries "{copy_command} output/output_all.coffea {abs_output_path}/output_job_$JOBID.coffea"'
+
+    timeitcommands = ""
+    if timeit:
+        timeitcommands = f'''\n    mkdir -p timeit\n    if compgen -G "timeit/*.json" > /dev/null; then\n        for f in timeit/*.json; do\n            run_with_retries "{timeit_copy_command} \\\"$f\\\" {timeit_dir}/"\n        done\n    fi\n'''
 
     script = f"""#!/bin/bash
 {env_extras}
@@ -353,7 +372,7 @@ failed_xrootd_sites="$_CONDOR_SCRATCH_DIR/failed_xrootd_sites.txt"
 while true; do
     attempt_log="$_CONDOR_SCRATCH_DIR/job_attempt_${{attempt}}.out"
     echo "Runner attempt $attempt"
-    setsid {runnercmd} --cfg "$2" -o output "${{EXECUTOR_ARGS[@]}}" --chunksize "$3" --custom-run-options {inner_yaml_basename} > "$attempt_log" 2>&1 &
+    setsid {runnercmd} --cfg "$2" -o output "${{EXECUTOR_ARGS[@]}}" --chunksize "$3" --custom-run-options {inner_yaml_basename}{' --timeit --_timeit-worker' if timeit else ''} > "$attempt_log" 2>&1 &
     child=$!
     child_pgid=$child
     wait "$child"
@@ -387,6 +406,7 @@ done
 if [ $job_succeeded -eq 1 ]; then
     echo 'Job successful'
     {splitcommands}
+    {timeitcommands}
     rm $JOBDIR/job_$JOBID.running
     touch $JOBDIR/job_$JOBID.done
 else
@@ -403,6 +423,133 @@ echo 'Done'
 class ExecutorFactoryCondorCERN(ExecutorFactoryManualABC):
     def get(self):
         pass
+
+    def prepare_splitting(self, filesets):
+        timeit_path = self.run_options.get("_timeit-dir")
+        throughputs = load_sample_throughputs(timeit_path) if timeit_path else {}
+        queue = self.run_options["queue"]
+        threshold = self._queue_threshold()
+        if queue == "auto" and not throughputs:
+            raise click.ClickException(
+                "--queue auto requires at least one valid timeit/*.json throughput file"
+            )
+
+        jobs = super().prepare_splitting(filesets)
+        if queue == "auto":
+            fallback = median(throughputs.values())
+            rates = {dataset: throughputs.get(dataset, fallback) for dataset in filesets}
+            job_seconds = self._job_runtime_seconds(filesets, jobs, rates)
+            self._per_job_queue = [
+                queue_for_runtime(seconds, threshold) for seconds in job_seconds
+            ]
+        else:
+            rates = throughputs
+            job_seconds = None
+            self._per_job_queue = [queue] * len(jobs)
+        if throughputs:
+            self._print_runtime_forecast(
+                filesets, jobs, throughputs, self._per_job_queue,
+                rates, job_seconds, queue == "auto",
+            )
+        return jobs
+
+    def _queue_threshold(self):
+        try:
+            threshold = float(self.run_options.get("queue_time_threshold_percent", 80))
+        except (TypeError, ValueError):
+            raise click.ClickException("queue_time_threshold_percent must be a number")
+        if not 0 < threshold < 100:
+            raise click.ClickException("queue_time_threshold_percent must be between 0 and 100")
+        return threshold
+
+    @staticmethod
+    def _job_runtime_seconds(filesets, jobs, rates):
+        job_seconds = []
+        for job in jobs:
+            seconds = 0.0
+            for dataset, split in job.items():
+                nfiles = len(filesets[dataset]["files"])
+                if nfiles == 0:
+                    raise click.ClickException(f"Cannot estimate runtime for empty dataset {dataset!r}")
+                average_events = int(filesets[dataset]["metadata"]["nevents"]) / nfiles
+                seconds += len(split["files"]) * average_events / rates[dataset]
+            job_seconds.append(seconds)
+        return job_seconds
+
+    def _print_runtime_forecast(
+        self, filesets, jobs, throughputs, per_job_queue,
+        rates, job_seconds, auto,
+    ):
+        queue = self.run_options["queue"]
+        threshold = self._queue_threshold()
+        if not auto and queue not in QUEUE_SECONDS:
+            raise click.ClickException(
+                f"Cannot estimate queue usage for unknown LXPLUS queue {queue!r}"
+            )
+
+        rows = []
+        for dataset, fileset in filesets.items():
+            rate = rates.get(dataset)
+            if rate is None and not auto:
+                rows.append((1, 0, dataset, None, None))
+                continue
+            nfiles = len(fileset["files"])
+            if not nfiles:
+                rows.append((1, 0, dataset, None, None))
+                continue
+            candidates = []
+            for index, job in enumerate(jobs):
+                if dataset not in job:
+                    continue
+                if auto:
+                    seconds = job_seconds[index]
+                else:
+                    average_events = int(fileset["metadata"]["nevents"]) / nfiles
+                    seconds = len(job[dataset]["files"]) * average_events / rate
+                candidates.append((seconds, per_job_queue[index]))
+            if not candidates:
+                rows.append((1, 0, dataset, None, None))
+                continue
+            seconds, assigned_queue = max(candidates)
+            percent = 100 * seconds / QUEUE_SECONDS[assigned_queue]
+            rows.append((0, seconds, dataset, assigned_queue, percent))
+        rows.sort(key=lambda row: (row[0], row[1], row[2]))
+
+        table = Table(title="Expected max time per job")
+        table.add_column("Sample", style="cyan")
+        table.add_column("Expected max time per job", justify="right")
+        table.add_column("Queue" if auto else "% of queue time", justify="right")
+        exceeds_limit = False
+        for missing, seconds, dataset, assigned_queue, percent in rows:
+            if missing:
+                table.add_row(dataset, "Missing", "Missing")
+                continue
+            exceeds_limit |= percent > threshold
+            colour = (
+                "red"
+                if (auto and assigned_queue == "nextweek" and percent > threshold)
+                or percent >= 95
+                else "yellow" if percent > threshold else "green"
+            )
+            hours, minutes = divmod(round(seconds / 60), 60)
+            queue_or_percent = assigned_queue if auto else f"{percent:.1f}%"
+            table.add_row(
+                dataset,
+                f"[{colour}]{hours}h{minutes:02d}m[/]",
+                f"[{colour}]{queue_or_percent}[/]",
+            )
+        Console().print(table)
+
+        if not auto and exceeds_limit:
+            Console().print(
+                "Alternatively, use --queue auto to select a queue per job.",
+                style="yellow",
+            )
+            if not click.confirm(
+                f"Some jobs may not fit in the {queue} queue. Proceed anyway?",
+                default=False,
+            ):
+                raise click.Abort()
 
     def prepare_jobs(self, splits):
         config_files = [ ]
@@ -480,6 +627,16 @@ class ExecutorFactoryCondorCERN(ExecutorFactoryManualABC):
         if abs_output_path.startswith(eos_prefix):
             copy_command = "xrdcp -f"
 
+        timeit = bool(self.run_options.get("timeit", False))
+        timeit_dir = self.run_options.get("_timeit-dir")
+        timeit_destination = timeit_dir
+        timeit_copy_command = "cp -f"
+        if timeit:
+            os.makedirs(timeit_dir, exist_ok=True)
+            if timeit_dir.startswith("/eos/"):
+                timeit_destination = eos_prefix + timeit_dir
+                timeit_copy_command = "xrdcp -f"
+
         # Handle columns
         columncommand = ""
         if len(self.config.columns) > 0 and "dump_columns_as_arrays_per_chunk" in self.config.workflow_options:
@@ -522,6 +679,9 @@ class ExecutorFactoryCondorCERN(ExecutorFactoryManualABC):
             inner_yaml_basename=inner_yaml_basename,
             split_by_category=self.run_options["split-by-category"],
             cores_per_worker=self.run_options["cores-per-worker"],
+            timeit=timeit,
+            timeit_dir=timeit_destination,
+            timeit_copy_command=timeit_copy_command,
         )
         with open(f"{self.jobs_dir}/job.sh", "w") as f:
             f.write(script)
@@ -532,6 +692,11 @@ class ExecutorFactoryCondorCERN(ExecutorFactoryManualABC):
         self._validate_chunksize_keys(chunksize_cfg, self.filesets)
         per_job_chunksize = [self._resolve_chunksize_for_job(chunksize_cfg, split)
                              for split in self._splits]
+        per_job_queue = getattr(
+            self, "_per_job_queue", [self.run_options["queue"]] * len(per_job_chunksize)
+        )
+        if len(per_job_queue) != len(per_job_chunksize):
+            raise ValueError("per_job_chunksize and per_job_queue must have the same length")
         if len(set(per_job_chunksize)) > 1:
             print(f"[chunksize] Per-job chunksize varies (min={min(per_job_chunksize)}, "
                   f"max={max(per_job_chunksize)}); HTCondor `queue chunksize from arglist.txt` "
@@ -545,7 +710,7 @@ class ExecutorFactoryCondorCERN(ExecutorFactoryManualABC):
             'Log': f"{abs_jobdir_path}/logs/job_$(ClusterId).log",
             'MY.SendCredential': True,
             'MY.SingularityImage': f'"{self.run_options["worker-image"]}"',
-            '+JobFlavour': f'"{self.run_options["queue"]}"',
+            '+JobFlavour': '"$(QUEUE)"',
             'RequestCpus' : self.run_options['cores-per-worker'],
             'RequestMemory' : f"{self.run_options['mem-per-worker']}",
             'arguments': f"$(ProcId) config_job_$(ProcId).pkl $(chunksize) {self.run_options['cores-per-worker']}",
@@ -566,14 +731,14 @@ class ExecutorFactoryCondorCERN(ExecutorFactoryManualABC):
         with open(f"{self.jobs_dir}/jobs_all.sub", "w") as f:
             for k, v in sub.items():
                 f.write(f"{k} = {v}\n")
-            f.write("queue chunksize from (\n")
-            for cs in per_job_chunksize:
-                f.write(f"  {cs}\n")
+            f.write("queue chunksize, QUEUE from (\n")
+            for cs, queue in zip(per_job_chunksize, per_job_queue):
+                f.write(f"  {cs} {queue}\n")
             f.write(")\n")
 
         job_state = build_condor_job_state(
             per_job_chunksize,
-            self.run_options["queue"],
+            per_job_queue,
             self.run_options["cores-per-worker"],
             self.run_options["mem-per-worker"],
         )
@@ -608,6 +773,7 @@ class ExecutorFactoryCondorCERN(ExecutorFactoryManualABC):
                         value = value.replace("$(ProcId)", str(i))
                         value = value.replace("$(ClusterId).log", f"$(ClusterId).{i}.log")
                         value = value.replace("$(chunksize)", str(per_job_chunksize[i]))
+                        value = value.replace("$(QUEUE)", per_job_queue[i])
                     f.write(f"{key} = {value}\n")
                 f.write("queue\n")
             # Let's also create a .idle file to indicate the the job is in idle
