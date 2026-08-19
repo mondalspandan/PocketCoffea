@@ -37,3 +37,40 @@ def test_filter_dataset_by_events_warns_and_keeps_invalid_dataset():
         config.filter_dataset_by_events(10)
 
     assert config.filesets["dataset"]["files"] == ["f0"]
+
+
+def test_filter_dataset_by_events_resolves_dataset_sample_and_default_targets():
+    config = Configurator.__new__(Configurator)
+    config.filesets = {
+        "TT_2023": {
+            "files": ["tt0", "tt1", "tt2", "tt3"],
+            "metadata": {"nevents": 400, "sample": "TT"},
+        },
+        "DY_2023": {
+            "files": ["dy0", "dy1", "dy2", "dy3"],
+            "metadata": {"nevents": 400, "sample": "DY"},
+        },
+        "W_2023": {
+            "files": ["w0", "w1", "w2", "w3"],
+            "metadata": {"nevents": 400, "sample": "W"},
+        },
+    }
+    config.datasets = list(config.filesets)
+
+    config.filter_dataset_by_events({"TT_2023": 201, "DY": 101, "default": 301})
+
+    assert len(config.filesets["TT_2023"]["files"]) == 3
+    assert len(config.filesets["DY_2023"]["files"]) == 2
+    assert len(config.filesets["W_2023"]["files"]) == 4
+
+
+def test_filter_dataset_by_events_rejects_missing_mapping_target():
+    config = _config(100, ["f0"])
+    with pytest.raises(ValueError, match="no entry"):
+        config.filter_dataset_by_events({"other": 10})
+
+
+def test_filter_dataset_by_events_rejects_nonpositive_scalar():
+    config = _config(100, ["f0"])
+    with pytest.raises(ValueError, match="must be positive"):
+        config.filter_dataset_by_events(0)

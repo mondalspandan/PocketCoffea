@@ -152,6 +152,26 @@ def test_recreate_queue_forced(tmp_path, replicas):
     assert '+JobFlavour="longlunch"' in (d / "job_0.sub").read_text()
 
 
+def test_recreate_queue_accepts_custom_value(tmp_path, replicas, capsys):
+    f = SITEA + "/store/data/foo.root"
+    d = _make_jobs_dir(tmp_path, {"job_0": {"filesets": _fs([f]), "flag": "failed"}})
+    check_jobs.recreate_jobs_oneshot(
+        d, "0", use_redirector=True, recreate_queue="customqueue", dry_run=True
+    )
+    assert '+JobFlavour="customqueue"' in (d / "job_0.sub").read_text()
+    assert "not in the known" in capsys.readouterr().out
+
+
+def test_queue_only_recreate_restores_original_fileset(tmp_path, replicas):
+    f = SITEA + "/store/data/foo.root"
+    d = _make_jobs_dir(tmp_path, {"job_0": {"filesets": _fs([f]), "flag": "failed"}})
+    check_jobs.recreate_jobs_oneshot(d, "0", use_redirector=True, dry_run=True)
+    assert _load_files(d / "config_job_0.pkl")[0].startswith(REDIR)
+
+    check_jobs.recreate_jobs_oneshot(d, "0", recreate_queue="workday", dry_run=True)
+    assert _load_files(d / "config_job_0.pkl") == [f]
+
+
 def test_recreate_running_job_keeps_queue_without_timeout(tmp_path, replicas):
     f = SITEA + "/store/data/foo.root"
     d = _make_jobs_dir(tmp_path, {"job_0": {"filesets": _fs([f]), "flag": "running", "flavour": "espresso"}})
@@ -474,3 +494,58 @@ def test_legacy_timeout_ncpu_one_records_scaling_decision(tmp_path, replicas):
     assert "RequestMemory = 4GB" in sub
     assert "arguments = 0 config_job_0.pkl 100 2" in sub
     assert sub.count(check_jobs.RESOURCE_SCALED_MARKER) == 1
+
+
+def _write_submission_contract(directory, **submission):
+    (directory / "jobs_config.yaml").write_text(yaml.safe_dump({"submission": submission}))
+
+
+def test_no_grid_certificate_recreation_skips_proxy_discovery(tmp_path, monkeypatch):
+    _write_submission_contract(
+        tmp_path,
+        requires_grid_certificate=False,
+        proxy_transfer_path=None,
+        proxy_source=None,
+    )
+    monkeypatch.setattr(check_jobs, "get_proxy_path", lambda: pytest.fail("proxy lookup"))
+    assert check_jobs.prepare_proxy_for_jobs(tmp_path) is None
+
+
+def test_default_proxy_contract_refreshes_recorded_path(tmp_path, monkeypatch):
+    source = tmp_path / "current.proxy"
+    target = tmp_path / "transfer.proxy"
+    source.write_text("fresh")
+    _write_submission_contract(
+        tmp_path,
+        requires_grid_certificate=True,
+        proxy_transfer_path=str(target),
+        proxy_source="default",
+    )
+    monkeypatch.setattr(check_jobs, "get_proxy_path", lambda: str(source))
+    assert check_jobs.prepare_proxy_for_jobs(tmp_path) == str(target)
+    assert target.read_text() == "fresh"
+
+
+def test_explicit_proxy_contract_does_not_refresh_default(tmp_path, monkeypatch):
+    target = tmp_path / "custom.proxy"
+    target.write_text("custom")
+    _write_submission_contract(
+        tmp_path,
+        requires_grid_certificate=True,
+        proxy_transfer_path=str(target),
+        proxy_source="explicit",
+    )
+    monkeypatch.setattr(check_jobs, "get_proxy_path", lambda: pytest.fail("default lookup"))
+    assert check_jobs.prepare_proxy_for_jobs(tmp_path) == str(target)
+
+
+def test_missing_required_proxy_fails_before_submission(tmp_path, monkeypatch):
+    target = tmp_path / "missing.proxy"
+    _write_submission_contract(
+        tmp_path,
+        requires_grid_certificate=True,
+        proxy_transfer_path=str(target),
+        proxy_source="explicit",
+    )
+    with pytest.raises(RuntimeError, match="does not exist"):
+        check_jobs.prepare_proxy_for_jobs(tmp_path)

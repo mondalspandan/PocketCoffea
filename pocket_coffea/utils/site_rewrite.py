@@ -91,7 +91,7 @@ def _query_replicas(lfn, client=None, scope="cms", sort="random"):
     `sort` is forwarded to rucio. The default is ``"random"`` because
     this helper is used to find an *alternative* replica for a file that
     just failed: geoip sorting would deterministically pick the same
-    nearby site for every file in a recreate-jobs pass, which both
+    nearby site for every file in a ``check-jobs --recreate`` pass, which both
     concentrates load on one site and is likely to re-hit the same
     unhealthy replica the user is trying to escape. Pass ``sort="geoip"``
     explicitly if you want the closest replica.

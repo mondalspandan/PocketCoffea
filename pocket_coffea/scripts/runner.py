@@ -8,6 +8,7 @@ import yaml
 from yaml import Loader, Dumper
 import click
 import time
+from collections.abc import Mapping
 from rich import print as rprint
 from rich.table import Table
 from rich.console import Console
@@ -31,11 +32,37 @@ from pocket_coffea.utils.benchmarking import (
 )
 
 
-def _lxplus_migration_flags(executor, run_options):
-    if executor != "condor@lxplus":
+def _manual_job_migration_flags(executor, run_options):
+    if executor not in ("condor@lxplus", "condor@rubin"):
         return []
     return [k for k in ("recreate-jobs", "use-redirector", "recreate-queue", "blocklist-sites")
             if k in run_options]
+
+
+def _executor_worker_count(executor, run_options):
+    """Return the concurrency represented by the active local executor."""
+    return 1 if executor == "iterative" else int(run_options.get("scaleout", 1))
+
+
+def _resolve_local_chunksize(chunksize_cfg, filesets):
+    """Resolve a mapping to one scalar accepted by Coffea's Runner."""
+    if not isinstance(chunksize_cfg, Mapping):
+        return int(chunksize_cfg)
+    values = []
+    for dataset, fileset in filesets.items():
+        sample = fileset.get("metadata", {}).get("sample")
+        value = chunksize_cfg.get(dataset)
+        if value is None and sample is not None:
+            value = chunksize_cfg.get(sample)
+        if value is None:
+            value = chunksize_cfg.get("default")
+        if value is None:
+            raise click.UsageError(
+                f"chunksize mapping has no entry for dataset {dataset!r} "
+                f"or sample {sample!r}, and no 'default' fallback"
+            )
+        values.append(int(value))
+    return max(values)
 
 @click.command(context_settings=dict(ignore_unknown_options=True, allow_extra_args=True))
 @click.option('--cfg', required=True, type=str,
@@ -174,10 +201,9 @@ def run(cfg,  custom_run_options, outputdir, test, limit_files, limit_samples,
         config.filter_dataset(run_options["limit-files"])
 
     # The manual-job recreate/resubmit path moved to `pocket-coffea check-jobs`.
-    # These flags used to be handled here (some as real options, --recreate-jobs
-    # via the pass-through loop above). Fail loudly with a pointer instead of
+    # These flags used to be handled here. Fail loudly with a pointer instead of
     # silently ignoring them.
-    _moved_flags = _lxplus_migration_flags(executor, run_options)
+    _moved_flags = _manual_job_migration_flags(executor, run_options)
     if _moved_flags:
         rprint(f"[red]ERROR:[/] the manual-job recreate options {_moved_flags} have moved to "
                f"[bold]pocket-coffea check-jobs[/].")
@@ -208,9 +234,6 @@ def run(cfg,  custom_run_options, outputdir, test, limit_files, limit_samples,
         filesets_to_run = {dataset: files for dataset, files in filesets_to_run.items() if dataset in filter_datasets}
     if limit_samples is not None:
         filesets_to_run = dict(list(filesets_to_run.items())[:limit_samples])
-    if timeit:
-        run_options["scaleout"] = len(filesets_to_run)
-
     # Run option display
     table = Table(title="Run Configuration")
     table.add_column("Option", style="cyan")
@@ -321,14 +344,19 @@ def run(cfg,  custom_run_options, outputdir, test, limit_files, limit_samples,
         n_events_tot = sum([int(files["metadata"]["nevents"]) for files in filesets_to_run.values()])
         logging.info("Total number of events: %d", n_events_tot)
 
-        adapted_chunksize = adapt_chunksize(n_events_tot, run_options)
-        if adapted_chunksize != run_options["chunksize"]:
-            logging.info(f"Reducing chunksize from {run_options['chunksize']} to {adapted_chunksize} for datasets")
+        runner_chunksize = (
+            _resolve_local_chunksize(run_options["chunksize"], filesets_to_run)
+            if timeit else run_options["chunksize"]
+        )
+        adapt_options = dict(run_options, chunksize=runner_chunksize)
+        adapted_chunksize = adapt_chunksize(n_events_tot, adapt_options)
+        if adapted_chunksize != runner_chunksize:
+            logging.info(f"Reducing chunksize from {runner_chunksize} to {adapted_chunksize} for datasets")
 
         # Get the coffea Runner wrapped with error logging
         run = get_runner(
             executor=executor,
-            chunksize=run_options["chunksize"],
+            chunksize=runner_chunksize,
             maxchunks=run_options["limit-chunks"],
             skipbadfiles=run_options['skip-bad-files'],
             schema=processor.NanoAODSchema,
@@ -344,7 +372,7 @@ def run(cfg,  custom_run_options, outputdir, test, limit_files, limit_samples,
         output.pop("processing_time", None)
         print(f"Saving output to {outfile.format('all')}")
         save(output, outfile.format("all") )
-        print_processing_stats(output, start_time, run_options["scaleout"])
+        print_processing_stats(output, start_time, _executor_worker_count(executor_name, run_options))
 
     else:
         if run_options["group-samples"] is not None:
@@ -395,14 +423,19 @@ def run(cfg,  custom_run_options, outputdir, test, limit_files, limit_samples,
             n_events_tot = sum([int(files["metadata"]["nevents"]) for files in fileset_.values()])
             logging.info("Total number of events: %d", n_events_tot)
 
-            adapted_chunksize = adapt_chunksize(n_events_tot, run_options)
-            if adapted_chunksize != run_options["chunksize"]:
-                logging.info(f"Reducing chunksize from {run_options['chunksize']} to {adapted_chunksize} for dataset(s) {group_name}")
+            runner_chunksize = (
+                _resolve_local_chunksize(run_options["chunksize"], fileset_)
+                if timeit else run_options["chunksize"]
+            )
+            adapt_options = dict(run_options, chunksize=runner_chunksize)
+            adapted_chunksize = adapt_chunksize(n_events_tot, adapt_options)
+            if adapted_chunksize != runner_chunksize:
+                logging.info(f"Reducing chunksize from {runner_chunksize} to {adapted_chunksize} for dataset(s) {group_name}")
 
             # Get the coffea Runner wrapped with error logging
             run = get_runner(
                 executor=executor,
-                chunksize=run_options["chunksize"],
+                chunksize=runner_chunksize,
                 maxchunks=run_options["limit-chunks"],
                 skipbadfiles=run_options['skip-bad-files'],
                 schema=processor.NanoAODSchema,
@@ -423,7 +456,10 @@ def run(cfg,  custom_run_options, outputdir, test, limit_files, limit_samples,
                 output.pop("processing_time", None)
                 print(f"Saving output to {outfile.format(group_name)}")
                 save(output, outfile.format(group_name))
-                print_processing_stats(output, dataset_start_time, run_options["scaleout"])
+                print_processing_stats(
+                    output, dataset_start_time,
+                    _executor_worker_count(executor_name, run_options),
+                )
 
         # Save the list of failed jobs
         if len(failed_jobs_list) > 0:

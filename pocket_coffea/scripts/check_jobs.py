@@ -48,7 +48,7 @@ from pocket_coffea.utils.site_rewrite import (
     rewrite_fileset_to_redirector,
     GLOBAL_XROOTD_REDIRECTOR,
 )
-from pocket_coffea.utils.htcondor_queue import QUEUES, bump_queue, set_queue
+from pocket_coffea.utils.htcondor_queue import QUEUES, bump_queue, next_queue, set_queue
 
 LOCK_FILENAME = ".check_jobs.lock"
 JOB_MARKERS = ("idle", "running", "done", "failed", "timeout")
@@ -257,8 +257,8 @@ _CONDOR_ABORT_RE = re.compile(
 )
 
 
-def recover_condor_log_failures(jobs_folder, log_offsets):
-    """Recover current event-009 removals into the normal job markers."""
+def scan_condor_log_failures(jobs_folder, log_offsets):
+    """Return current event-009 failures without changing the jobs directory."""
     jobs_folder = Path(jobs_folder)
     active = {}
     for marker in ("idle", "running"):
@@ -310,17 +310,54 @@ def recover_condor_log_failures(jobs_folder, log_offsets):
                     recovered[job] = (event_time, reason)
             log_offsets[key] = handle.tell()
 
+    findings = {}
     for job, (_, reason) in recovered.items():
         if any((jobs_folder / f"{job}.{terminal}").exists()
                for terminal in ("done", "failed", "timeout")):
             continue
-        clear_job_markers(jobs_folder, job)
-        marker = "timeout" if (
+        findings[job] = "timeout" if (
             "SYSTEM_PERIODIC_REMOVE" in reason
             and "wall time exceeded" in reason.lower()
         ) else "failed"
-        (jobs_folder / f"{job}.{marker}").touch()
-    return len(recovered)
+    return findings
+
+
+def apply_condor_log_failures(jobs_folder, findings):
+    """Materialise scan findings as normal markers during active recovery."""
+    for job, marker in findings.items():
+        if any((Path(jobs_folder) / f"{job}.{terminal}").exists()
+               for terminal in ("done", "failed", "timeout")):
+            continue
+        clear_job_markers(jobs_folder, job)
+        (Path(jobs_folder) / f"{job}.{marker}").touch()
+
+
+def recover_condor_log_failures(jobs_folder, log_offsets):
+    """Compatibility wrapper: scan and apply event-009 failures."""
+    findings = scan_condor_log_failures(jobs_folder, log_offsets)
+    apply_condor_log_failures(jobs_folder, findings)
+    return len(findings)
+
+
+def merge_inferred_status(idle_jobs, running_jobs, done_jobs, failed_jobs,
+                          timeout_jobs, findings):
+    """Overlay in-memory Condor-log findings for passive display only."""
+    idle_jobs = list(idle_jobs)
+    running_jobs = list(running_jobs)
+    done_jobs = list(done_jobs)
+    failed_jobs = list(failed_jobs)
+    timeout_jobs = list(timeout_jobs)
+    for job, marker in findings.items():
+        if job in done_jobs or job in failed_jobs or job in timeout_jobs:
+            continue
+        if job in idle_jobs:
+            idle_jobs.remove(job)
+        if job in running_jobs:
+            running_jobs.remove(job)
+        target = timeout_jobs if marker == "timeout" else failed_jobs
+        if job not in target:
+            target.append(job)
+    return idle_jobs, running_jobs, done_jobs, failed_jobs, timeout_jobs
 
 
 def get_progress_table(group_counts, label, multi_sample_overlap=False, bar_width=30):
@@ -449,7 +486,7 @@ def recreate_jobs_oneshot(jobs_folder, jobs_to_recreate, *, use_redirector=False
                           dry_run=False):
     """One-shot recreate/resubmit of a chosen set of manual jobs.
 
-    Ported from the manual-job executors' old ``--recreate-jobs`` path so the
+    Ported from the manual-job executors' old recreation path so the
     functionality lives in one place. Operates purely on the jobs_dir on-disk
     contract (``jobs_config.yaml`` + ``config_job_i.pkl`` + ``job_i.sub`` +
     the flag files), and — unlike the reactive ``--resubmit`` loop — can act on
@@ -582,11 +619,8 @@ def recreate_jobs_oneshot(jobs_folder, jobs_to_recreate, *, use_redirector=False
         # Source the ORIGINAL fileset from jobs_config.yaml (from-scratch) so
         # repeated recreates don't compound rewrites.
         new_fileset = deepcopy(jobs_config["jobs_list"][job]["filesets"])
-        modified = False
-
         if use_redirector:
             new_fileset = rewrite_fileset_to_redirector(new_fileset)
-            modified = True
         else:
             if job in xrootd_fail_jobs:
                 rprint(f"Replacing input files in {job} since it failed due to an XRootD error.")
@@ -596,17 +630,14 @@ def recreate_jobs_oneshot(jobs_folder, jobs_to_recreate, *, use_redirector=False
                                         rucio_client=rucio_client)
                         for fl in dct['files']
                     ]
-                modified = True
             if blocklist_sites:
                 new_fileset = rewrite_fileset_blocklist(new_fileset, sitemap, blocklist_sites,
                                                         rucio_client=rucio_client)
-                modified = True
 
-        if modified:
-            cfgfile = f"{jobs_folder}/config_{job}.pkl"
-            config = cloudpickle.load(open(cfgfile, "rb"))
-            config.set_filesets_manually(new_fileset)
-            cloudpickle.dump(config, open(cfgfile, "wb"))
+        cfgfile = f"{jobs_folder}/config_{job}.pkl"
+        config = cloudpickle.load(open(cfgfile, "rb"))
+        config.set_filesets_manually(new_fileset)
+        cloudpickle.dump(config, open(cfgfile, "wb"))
 
         if skip_bad_files and ensure_sub_transfers is not None:
             ensure_sub_transfers(f"{jobs_folder}/{job}.sub", abs_jobdir)
@@ -626,9 +657,13 @@ def recreate_jobs_oneshot(jobs_folder, jobs_to_recreate, *, use_redirector=False
         if selected_queue is not None:
             sync_dynamic_queue(jobs_folder, job, selected_queue, job_state, state_file)
 
+        if job_state is not None and job.split("_", 1)[1] in job_state:
+            materialize_job_submit_state(jobs_folder, job.split("_", 1)[1], job_state)
+
         if dry_run:
             rprint(f"[dim]Dry run, not resubmitting {job}[/]")
             continue
+        prepare_proxy_for_jobs(jobs_folder)
         submitted, output = condor_submit_job(jobs_folder, f"{job}.sub")
         if submitted:
             mark_job_idle(jobs_folder, job)
@@ -649,6 +684,102 @@ def save_job_state(state_file, job_state):
         json.dump(job_state, f, indent=2, sort_keys=True)
 
 
+def _submission_proxy_contract(jobs_folder):
+    """Read the durable proxy contract, with a conservative legacy fallback."""
+    jobs_folder = Path(jobs_folder)
+    jobs_config = jobs_folder / "jobs_config.yaml"
+    if jobs_config.exists():
+        with jobs_config.open() as handle:
+            metadata = (yaml.safe_load(handle) or {}).get("submission")
+        if metadata is not None:
+            return {
+                "requires_grid_certificate": bool(metadata.get("requires_grid_certificate", False)),
+                "proxy_transfer_path": metadata.get("proxy_transfer_path"),
+                "proxy_source": metadata.get("proxy_source", "default"),
+            }
+
+    submit_files = sorted(jobs_folder.glob("job_*.sub")) or [jobs_folder / "resubmit.sub"]
+    for submit_file in submit_files:
+        if not submit_file.exists():
+            continue
+        for line in submit_file.read_text().splitlines():
+            if not line.startswith("transfer_input_files"):
+                continue
+            values = line.split("=", 1)[1].strip().split(",")
+            candidates = [
+                value.strip().strip('"') for value in values
+                if "config_job_" not in value
+                and not value.endswith("job.sh")
+                and not value.endswith("inner_run_options.yaml")
+            ]
+            if candidates:
+                candidate = candidates[0]
+                default_proxy = os.path.basename(candidate).startswith("x509")
+                return {
+                    "requires_grid_certificate": True,
+                    "proxy_transfer_path": candidate,
+                    "proxy_source": "default" if default_proxy else "legacy",
+                }
+            return {
+                "requires_grid_certificate": False,
+                "proxy_transfer_path": None,
+                "proxy_source": None,
+            }
+    return {
+        "requires_grid_certificate": False,
+        "proxy_transfer_path": None,
+        "proxy_source": None,
+    }
+
+
+def prepare_proxy_for_jobs(jobs_folder):
+    """Prepare exactly the proxy path recorded by the original submission."""
+    contract = _submission_proxy_contract(jobs_folder)
+    if not contract["requires_grid_certificate"]:
+        return None
+    proxy_path = contract.get("proxy_transfer_path")
+    if not proxy_path:
+        raise RuntimeError("The jobs require a grid certificate but no proxy transfer path was recorded")
+    proxy_path = os.path.expandvars(proxy_path)
+    source = proxy_path
+    if contract.get("proxy_source") == "default":
+        source = get_proxy_path()
+        os.makedirs(os.path.dirname(proxy_path) or ".", exist_ok=True)
+        if os.path.abspath(source) != os.path.abspath(proxy_path):
+            import shutil
+            shutil.copyfile(source, proxy_path)
+    if not os.path.exists(proxy_path):
+        raise RuntimeError(f"Required proxy transfer path does not exist: {proxy_path}")
+    os.environ["X509_USER_PROXY"] = proxy_path
+    return proxy_path
+
+
+def materialize_job_submit_state(jobs_folder, job_num, job_state):
+    """Rewrite a concrete submit file from the authoritative per-job state."""
+    state = job_state[str(job_num)]
+    sub_file = Path(jobs_folder) / f"job_{job_num}.sub"
+    if not sub_file.exists():
+        return False
+    lines = []
+    for line in sub_file.read_text().splitlines(keepends=True):
+        stripped = line.strip()
+        if "+JobFlavour" in line and state.get("queue") is not None:
+            line = f'+JobFlavour="{state["queue"]}"\n'
+        elif stripped.startswith("RequestCpus"):
+            line = f"RequestCpus = {state['request_cpus']}\n"
+        elif stripped.startswith("RequestMemory"):
+            line = f"RequestMemory = {state['request_memory']}\n"
+        elif stripped.startswith("arguments") and "$" not in line:
+            line = re.sub(
+                r"(config_job_[^\s]+\.pkl\s+)\S+(\s+)\S+\s*$",
+                rf"\g<1>{state['chunksize']}\g<2>{state['request_cpus']}\n",
+                line,
+            )
+        lines.append(line)
+    sub_file.write_text("".join(lines))
+    return True
+
+
 def sync_dynamic_queue(jobs_folder, job_name, queue, job_state=None, state_file=None):
     """Keep proactive recreation and dynamic reactive retries on one queue."""
     state_file = Path(state_file) if state_file is not None else Path(jobs_folder) / "job_state.json"
@@ -659,21 +790,10 @@ def sync_dynamic_queue(jobs_folder, job_name, queue, job_state=None, state_file=
     job_num = job_name.split("_", 1)[1]
     if job_num not in job_state:
         return False
-    sub_file = Path(jobs_folder) / f"{job_name}.sub"
-    if sub_file.exists():
-        set_queue(sub_file, queue, job_name)
     job_state[job_num]["queue"] = queue
     save_job_state(state_file, job_state)
+    materialize_job_submit_state(jobs_folder, job_num, job_state)
     return True
-
-
-def setup_proxyfile():
-    _x509_localpath = get_proxy_path()
-    x509_path = os.environ["HOME"] + f'/{_x509_localpath.split("/")[-1]}'
-    if _x509_localpath != x509_path:
-        print("Copying proxy file to $HOME.")
-        os.system(f"scp {_x509_localpath} {x509_path}")
-    os.environ["X509_USER_PROXY"] = x509_path
 
 
 def scale_memory(memory, factor):
@@ -721,13 +841,7 @@ def scale_submit_resources(sub_file, factor):
 def escalate_timeout_job(jobs_folder, job, job_state, state_file, queue_shift, ncpu):
     job_num = job.split("_", 1)[1]
     selected_queue = bump_jobqueue(job_num, job_state, state_file, queue_shift, ncpu)
-    if job_state is not None and job_num in job_state:
-        update_job_submit_resources(
-            f"{jobs_folder}/{job}.sub",
-            job_state[job_num]["request_cpus"],
-            job_state[job_num]["request_memory"],
-        )
-    elif selected_queue is not None:
+    if job_state is None and selected_queue is not None:
         scale_submit_resources(f"{jobs_folder}/{job}.sub", ncpu)
     return selected_queue
 
@@ -744,15 +858,13 @@ def bump_jobqueue(job_num, job_state=None, state_file=None, shift=1, ncpu=1):
         return bump_queue(Path(state_file).parent / f"job_{job_num}.sub", shift)
     state = job_state[str(job_num)]
     current_queue = state["queue"]
-    state["queue"] = QUEUES[min(QUEUES.index(current_queue) + shift, len(QUEUES) - 1)]
+    state["queue"] = next_queue(current_queue, shift)
     if not state["resources_scaled"]:
         state["request_cpus"] = int(state["base_cpus"]) * ncpu
         state["request_memory"] = scale_memory(state["base_memory"], ncpu)
         state["resources_scaled"] = True
-    sub_file = Path(state_file).parent / f"job_{job_num}.sub"
-    if sub_file.exists():
-        set_queue(sub_file, state["queue"], f"job_{job_num}")
     save_job_state(state_file, job_state)
+    materialize_job_submit_state(Path(state_file).parent, job_num, job_state)
     return state["queue"]
 
 
@@ -781,6 +893,9 @@ def submit_resubmit_jobs(jobs_folder, job_nums, job_state, state_file, log_text)
     job_nums = [job_num for job_num in job_nums if job_num in job_state]
     if not job_nums:
         return False
+
+    for job_num in job_nums:
+        materialize_job_submit_state(jobs_folder, job_num, job_state)
 
     with open(f"{jobs_folder}/resubmit.sub") as f:
         template = f.read()
@@ -861,7 +976,7 @@ def convert_timeout_jobs(jobs_folder, timeout_jobs, running_jobs, idle_jobs, fai
               help="With --recreate, rewrite files through the global XRootD redirector.")
 @click.option("--blocklist-sites", type=str, default=None,
               help="With --recreate, comma-separated CMS/Rucio site names to avoid.")
-@click.option("--recreate-queue", type=click.Choice(QUEUES), default=None,
+@click.option("--recreate-queue", type=str, default=None,
               help="With --recreate, force jobs to this HTCondor queue.")
 @click.option("--skip-bad-files", is_flag=True, default=False,
               help="With --recreate, enable Coffea skip-bad-files.")
@@ -948,7 +1063,7 @@ def check_jobs(jobs_folder, details, resubmit, max_resubmit,
 
     if resubmit:
         try:
-            setup_proxyfile()
+            prepare_proxy_for_jobs(jobs_folder)
         except Exception as exc:
             rprint(f"[red]{exc}[/]")
             raise SystemExit(1)
@@ -958,13 +1073,21 @@ def check_jobs(jobs_folder, details, resubmit, max_resubmit,
     layout = create_layout(with_progress=show_progress)
     log_text = []
     condor_log_offsets = {}
-    recover_condor_log_failures(jobs_folder, condor_log_offsets)
+    mutation_enabled = recreate is not None or resubmit
+    findings = scan_condor_log_failures(jobs_folder, condor_log_offsets)
     idle_jobs, running_jobs, done_jobs, failed_jobs, timeout_jobs = check_jobs_logs(jobs_folder)
     initially_shifted_jobs = set()
-    convert_timeout_jobs(
-        jobs_folder, timeout_jobs, running_jobs, idle_jobs, failed_jobs,
-        queue_shift, ncpu, job_state, state_file, log_text, initially_shifted_jobs,
-    )
+    if mutation_enabled:
+        apply_condor_log_failures(jobs_folder, findings)
+        idle_jobs, running_jobs, done_jobs, failed_jobs, timeout_jobs = check_jobs_logs(jobs_folder)
+        convert_timeout_jobs(
+            jobs_folder, timeout_jobs, running_jobs, idle_jobs, failed_jobs,
+            queue_shift, ncpu, job_state, state_file, log_text, initially_shifted_jobs,
+        )
+    else:
+        idle_jobs, running_jobs, done_jobs, failed_jobs, timeout_jobs = merge_inferred_status(
+            idle_jobs, running_jobs, done_jobs, failed_jobs, timeout_jobs, findings
+        )
     tables = get_tables(tot_jobs, idle_jobs, running_jobs, done_jobs, failed_jobs, timeout_jobs, details=details)
     if show_progress:
         layout["summary"].update(Panel(tables[0], title="Job Status"))
@@ -982,14 +1105,21 @@ def check_jobs(jobs_folder, details, resubmit, max_resubmit,
         try:
             while True:
                 step += 1
-                recover_condor_log_failures(jobs_folder, condor_log_offsets)
+                findings = scan_condor_log_failures(jobs_folder, condor_log_offsets)
                 idle_jobs, running_jobs, done_jobs, failed_jobs, timeout_jobs = check_jobs_logs(jobs_folder)
                 shifted_jobs = initially_shifted_jobs
                 initially_shifted_jobs = set()
-                convert_timeout_jobs(
-                    jobs_folder, timeout_jobs, running_jobs, idle_jobs, failed_jobs,
-                    queue_shift, ncpu, job_state, state_file, log_text, shifted_jobs,
-                )
+                if mutation_enabled:
+                    apply_condor_log_failures(jobs_folder, findings)
+                    idle_jobs, running_jobs, done_jobs, failed_jobs, timeout_jobs = check_jobs_logs(jobs_folder)
+                    convert_timeout_jobs(
+                        jobs_folder, timeout_jobs, running_jobs, idle_jobs, failed_jobs,
+                        queue_shift, ncpu, job_state, state_file, log_text, shifted_jobs,
+                    )
+                else:
+                    idle_jobs, running_jobs, done_jobs, failed_jobs, timeout_jobs = merge_inferred_status(
+                        idle_jobs, running_jobs, done_jobs, failed_jobs, timeout_jobs, findings
+                    )
                 tables = get_tables(tot_jobs, idle_jobs, running_jobs, done_jobs, failed_jobs, timeout_jobs, details=details)
                 # Update the left panel(s) with fresh tables
                 if show_progress:
@@ -1002,6 +1132,7 @@ def check_jobs(jobs_folder, details, resubmit, max_resubmit,
                     layout["left"].update(Panel(tables[0], title="Job Status"))
 
                 resubmit_now = []
+                ordinary_bumps = []
                 # Checking failed jobs
                 if len(failed_jobs) > 0:
                     if len(failed_jobs) > len(definitive_failed) and not resubmit:
@@ -1037,10 +1168,26 @@ def check_jobs(jobs_folder, details, resubmit, max_resubmit,
                                         f"{failed_job} exhausted XRootD recovery. "
                                         "Resubmitting the original AFS config without queue changes."
                                     )
+                                elif (
+                                    job_state is not None
+                                    and failed_job_num in job_state
+                                    and job_state[failed_job_num].get("resubmissions", 0) >= 1
+                                    and failed_job not in timeout_jobs
+                                    and failed_job not in shifted_jobs
+                                ):
+                                    ordinary_bumps.append(failed_job_num)
                                 resubmit_now.append(failed_job_num)
                             else:
                                 # Add it to the list of jobs that are definitely failed
                                 definitive_failed.append(failed_job)
+
+                for job_num in ordinary_bumps:
+                    escalated_queue = bump_jobqueue(
+                        job_num, job_state, state_file, queue_shift, ncpu
+                    )
+                    log_text.append(
+                        f"job_{job_num} failed again; escalating to {escalated_queue}."
+                    )
 
                 if resubmit_now:
                     if submit_resubmit_jobs(

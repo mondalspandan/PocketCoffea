@@ -130,12 +130,10 @@ class ExecutorFactoryManualABC(ABC):
         self.run_options = run_options
         self.job_name = run_options.get("job-name", "job")
         self.jobs_dir = os.path.join(run_options.get("jobs-dir", outputdir), self.job_name)
-        recreate_jobs = run_options.get("recreate-jobs")
-        if not recreate_jobs and os.path.exists(self.jobs_dir):
+        if os.path.exists(self.jobs_dir):
             print(f"Jobs directory {self.jobs_dir} already exists. Please clean it up before running the jobs.")
             exit(1)
-        if not recreate_jobs:
-            os.makedirs(self.jobs_dir)
+        os.makedirs(self.jobs_dir)
         self.setup()
         # If handles_submission == True, the executor is responsible for submitting the job
         self.handles_submission = True
@@ -182,10 +180,6 @@ class ExecutorFactoryManualABC(ABC):
         self.config = config
         self.outputdir = outputdir
         self.filesets = filesets
-        jobs_to_recreate = self.run_options.get("recreate-jobs")
-        if jobs_to_recreate:
-            self.recreate_jobs(jobs_to_recreate)
-            return
         splits = self.prepare_splitting(filesets)
         # Save the per-job splits so submit_jobs can resolve per-job options
         # (per-sample chunksize, etc.) without re-reading jobs_config.yaml.
@@ -418,7 +412,7 @@ class ExecutorFactoryManualABC(ABC):
         if not isinstance(chunksize_cfg, Mapping):
             return
         samples_present = {fs["metadata"]["sample"] for fs in filesets.values()}
-        unknown = {k for k in chunksize_cfg if k != "default"} - samples_present
+        unknown = {k for k in chunksize_cfg if k != "default"} - (set(filesets) | samples_present)
         if unknown:
             print(f"[chunksize] WARNING: dict keys {sorted(unknown)} do not match any sample in the "
                   f"current fileset. Samples present: {sorted(samples_present)}. These keys will be ignored.")
@@ -447,7 +441,10 @@ class ExecutorFactoryManualABC(ABC):
                 f"or revert chunksize to a scalar value."
             )
         sample = next(iter(samples))
-        value = chunksize_cfg.get(sample, chunksize_cfg.get("default"))
+        dataset = next(iter(job_split))
+        value = chunksize_cfg.get(dataset)
+        if value is None:
+            value = chunksize_cfg.get(sample, chunksize_cfg.get("default"))
         if value is None:
             raise Exception(
                 f"chunksize dict has no entry for sample {sample!r} and no 'default' fallback. "

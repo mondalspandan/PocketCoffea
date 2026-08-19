@@ -337,6 +337,14 @@ def test_validate_chunksize_keys_accepts_non_dict_mapping(capsys):
     assert "Typo" in captured
 
 
+def test_chunksize_mapping_prefers_exact_dataset_key():
+    job = _make_single_sample_job("TT")
+    dataset = next(iter(job))
+    assert ExecutorFactoryManualABC._resolve_chunksize_for_job(
+        {dataset: 25_000, "TT": 50_000, "default": 150_000}, job
+    ) == 25_000
+
+
 class _ManualFactory(ExecutorFactoryManualABC):
     def get(self):
         return None
@@ -346,11 +354,6 @@ class _ManualFactory(ExecutorFactoryManualABC):
 
     def submit_jobs(self, jobs):
         raise AssertionError("recreation must not submit through the normal path")
-
-    def recreate_jobs(self, jobs):
-        self.recreated = jobs
-        self.recreate_attributes = (self.config, self.outputdir, self.filesets)
-
 
 def _manual_options(tmp_path, **extra):
     options = {
@@ -368,17 +371,7 @@ def test_manual_factory_rejects_existing_directory_for_new_submission(tmp_path):
         _ManualFactory(_manual_options(tmp_path), str(tmp_path))
 
 
-def test_manual_factory_recreation_accepts_existing_directory(tmp_path):
+def test_manual_factory_rejects_recreate_bypass_of_existing_directory(tmp_path):
     (tmp_path / "job").mkdir()
-    factory = _ManualFactory(_manual_options(tmp_path, **{"recreate-jobs": "0"}), str(tmp_path))
-    assert factory.jobs_dir == str(tmp_path / "job")
-
-
-def test_manual_factory_submit_dispatches_recreation(tmp_path):
-    (tmp_path / "job").mkdir()
-    factory = _ManualFactory(_manual_options(tmp_path, **{"recreate-jobs": "0"}), str(tmp_path))
-    factory.submit(object(), {}, str(tmp_path))
-    assert factory.recreated == "0"
-    assert factory.recreate_attributes[0] is not None
-    assert factory.recreate_attributes[1] == str(tmp_path)
-    assert factory.recreate_attributes[2] == {}
+    with pytest.raises(SystemExit):
+        _ManualFactory(_manual_options(tmp_path, **{"recreate-jobs": "0"}), str(tmp_path))

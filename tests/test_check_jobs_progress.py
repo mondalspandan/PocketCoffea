@@ -336,6 +336,84 @@ def test_condor_log_scanner_waits_for_reason_line(tmp_path):
     assert (tmp_path / "job_0.failed").exists()
 
 
+def test_passive_check_jobs_does_not_materialize_log_failure(tmp_path, monkeypatch):
+    from pocket_coffea.scripts import check_jobs
+
+    (tmp_path / "job_0.running").write_text("")
+    state = {"0": {"queue": "espresso", "chunksize": 100,
+                    "base_cpus": 1, "base_memory": "4GB",
+                    "request_cpus": 1, "request_memory": "4GB",
+                    "resources_scaled": False, "resubmissions": 0}}
+    state_file = tmp_path / "job_state.json"
+    state_file.write_text(json.dumps(state))
+    sub_file = tmp_path / "job_0.sub"
+    sub_file.write_text(
+        '+JobFlavour="espresso"\nRequestCpus = 1\nRequestMemory = 4GB\n'
+        'arguments = 0 config_job_0.pkl 100 1\nqueue\n'
+    )
+    logs = tmp_path / "logs"
+    logs.mkdir()
+    stamp = time.strftime("%m/%d %H:%M:%S", time.localtime(time.time() + 2))
+    (logs / "job_123.log").write_text(_condor_abort(
+        0, stamp,
+        "Job removed by SYSTEM_PERIODIC_REMOVE due to wall time exceeded allowed max.",
+    ))
+
+    before = {
+        path: (path.read_bytes(), path.stat().st_mtime_ns)
+        for path in (state_file, sub_file, tmp_path / "job_0.running")
+    }
+    monkeypatch.setattr(check_jobs, "condor_submit_job", lambda *args: pytest.fail("submit"))
+    monkeypatch.setattr(check_jobs, "condor_rm_job", lambda *args: pytest.fail("remove"))
+
+    result = CliRunner().invoke(
+        check_jobs.check_jobs,
+        ["--jobs-folder", str(tmp_path), "--once", "--by", "none"],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert not (tmp_path / "job_0.timeout").exists()
+    assert not (tmp_path / "job_0.failed").exists()
+    for path, snapshot in before.items():
+        assert (path.read_bytes(), path.stat().st_mtime_ns) == snapshot
+
+
+def test_active_check_jobs_materializes_log_failure_and_resubmits(tmp_path, monkeypatch):
+    from pocket_coffea.scripts import check_jobs
+
+    (tmp_path / "job_0.running").write_text("")
+    state_file = tmp_path / "job_state.json"
+    state_file.write_text(json.dumps({
+        "0": {"queue": "espresso", "chunksize": 100,
+               "base_cpus": 1, "base_memory": "4GB",
+               "request_cpus": 1, "request_memory": "4GB",
+               "resources_scaled": False, "resubmissions": 0},
+    }))
+    (tmp_path / "job_0.sub").write_text(
+        '+JobFlavour="espresso"\nRequestCpus = 1\nRequestMemory = 4GB\n'
+        'arguments = 0 config_job_0.pkl 100 1\nqueue\n'
+    )
+    logs = tmp_path / "logs"
+    logs.mkdir()
+    stamp = time.strftime("%m/%d %H:%M:%S", time.localtime(time.time() + 2))
+    (logs / "job_123.log").write_text(_condor_abort(
+        0, stamp,
+        "Job removed by SYSTEM_PERIODIC_REMOVE due to wall time exceeded allowed max.",
+    ))
+    monkeypatch.setattr(check_jobs, "condor_submit_job", lambda *args: (True, "submitted"))
+
+    result = CliRunner().invoke(
+        check_jobs.check_jobs,
+        ["--jobs-folder", str(tmp_path), "--once", "--by", "none", "--resubmit", "--ncpu", "3"],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert (tmp_path / "job_0.idle").exists()
+    persisted = json.loads(state_file.read_text())
+    assert persisted["0"]["queue"] == "microcentury"
+    assert persisted["0"]["request_cpus"] == 3
+
+
 def test_convert_timeout_jobs_bumps_queue_and_marks_failed(tmp_path):
     from pocket_coffea.scripts.check_jobs import convert_timeout_jobs
 
@@ -425,6 +503,46 @@ def test_bump_jobqueue_updates_concrete_submit_queue(tmp_path):
 
     assert bump_jobqueue("0", job_state, state_file) == "microcentury"
     assert '+JobFlavour="microcentury"' in sub_file.read_text()
+
+
+def test_state_materialization_preserves_escalated_resources_for_recreate(tmp_path):
+    from pocket_coffea.scripts.check_jobs import bump_jobqueue, materialize_job_submit_state
+
+    state_file = tmp_path / "job_state.json"
+    sub_file = tmp_path / "job_0.sub"
+    sub_file.write_text(
+        '+JobFlavour="espresso"\nRequestCpus = 2\nRequestMemory = 4GB\n'
+        'arguments = 0 config_job_0.pkl 150000 2\nqueue\n'
+    )
+    job_state = {
+        "0": {
+            "queue": "espresso", "chunksize": 150000,
+            "base_cpus": 2, "base_memory": "4GB",
+            "request_cpus": 2, "request_memory": "4GB",
+            "resources_scaled": False, "resubmissions": 0,
+        }
+    }
+
+    bump_jobqueue("0", job_state, state_file, shift=1, ncpu=3)
+    materialize_job_submit_state(tmp_path, "0", job_state)
+    sub = sub_file.read_text()
+    assert '+JobFlavour="microcentury"' in sub
+    assert "RequestCpus = 6" in sub
+    assert "RequestMemory = 12GB" in sub
+    assert "arguments = 0 config_job_0.pkl 150000 6" in sub
+
+
+def test_unknown_dynamic_queue_bumps_to_nextweek(tmp_path):
+    from pocket_coffea.scripts.check_jobs import bump_jobqueue
+
+    state_file = tmp_path / "job_state.json"
+    state = {
+        "0": {"queue": "customqueue", "chunksize": 100,
+               "base_cpus": 1, "base_memory": "4GB",
+               "request_cpus": 1, "request_memory": "4GB",
+               "resources_scaled": False, "resubmissions": 0},
+    }
+    assert bump_jobqueue("0", state, state_file) == "nextweek"
 
 
 def test_xrootd_exhaustion_log_is_detected():

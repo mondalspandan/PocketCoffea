@@ -25,7 +25,11 @@ def _filesets():
 
 def _factory(tmp_path, queue="workday"):
     factory = object.__new__(ExecutorFactoryCondorCERN)
-    factory.run_options = {"queue": queue, "_timeit-dir": str(tmp_path / "timeit")}
+    factory.run_options = {
+        "queue": queue,
+        "_timeit-dir": str(tmp_path / "timeit"),
+        "cores-per-worker": 1,
+    }
     return factory
 
 
@@ -174,3 +178,14 @@ def test_auto_mixed_dataset_runtime_is_summed(tmp_path):
     }
     jobs = [{"fast": filesets["fast"], "slow": filesets["slow"]}]
     assert factory._job_runtime_seconds(filesets, jobs, {"fast": 1.0, "slow": 2.0}) == [1500.0]
+
+
+def test_runtime_forecast_scales_per_worker_throughput(tmp_path):
+    filesets = {"dataset": {"files": ["f"], "metadata": {"nevents": 1000}}}
+    jobs = [{"dataset": filesets["dataset"]}]
+    factory = _factory(tmp_path)
+    one_worker = factory._job_runtime_seconds(filesets, jobs, {"dataset": 100.0})
+    factory.run_options["cores-per-worker"] = 4
+    four_workers = factory._job_runtime_seconds(filesets, jobs, {"dataset": 100.0})
+    assert one_worker == [10.0]
+    assert four_workers == [2.5]

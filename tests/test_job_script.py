@@ -99,8 +99,9 @@ def test_split_by_category_runs_in_output_and_is_exit_checked():
 
 
 def test_timeit_forwards_worker_flag_and_copies_json_with_overwrite():
-    script = _script(timeit=True)
+    script = _script(timeit=True, cores=4)
     assert "--timeit --_timeit-worker" in script
+    assert 'EXECUTOR_ARGS=(--executor futures --scaleout "$4")' in script
     assert 'mkdir -p timeit' in script
     assert 'timeit/*.json' in script
     assert 'cp -f' in script

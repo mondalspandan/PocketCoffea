@@ -45,6 +45,13 @@ def queue_for_runtime(seconds, threshold_percent):
     )
 
 
+def next_queue(current, shift=1):
+    """Advance a queue name, using the longest known queue for unknown names."""
+    if current not in QUEUES:
+        return QUEUES[-1]
+    return QUEUES[min(QUEUES.index(current) + int(shift), len(QUEUES) - 1)]
+
+
 def _read_flavour(line):
     """Extract the flavour value from a ``+JobFlavour`` line, tolerating both
     ``+JobFlavour="x"`` and ``+JobFlavour = "x"`` spacing."""
@@ -66,12 +73,7 @@ def bump_queue(sub_file, shift=1):
         for line in lines:
             if "+JobFlavour" in line:
                 jf = _read_flavour(line)
-                if jf in QUEUES:
-                    next_jf = QUEUES[min(QUEUES.index(jf) + shift, len(QUEUES) - 1)]
-                else:
-                    # Unknown flavour (e.g. a non-lxplus queue): bump to the longest
-                    # known queue rather than raising ValueError on QUEUES.index.
-                    next_jf = QUEUES[-1]
+                next_jf = next_queue(jf, shift)
                 f.write(f'+JobFlavour="{next_jf}"\n')
             else:
                 f.write(line)

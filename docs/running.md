@@ -553,7 +553,7 @@ called `job`, the tool descends into it automatically.
 | `--once` | off | Run a single monitor/resubmit iteration then exit, instead of looping until all jobs finish. |
 | `--use-redirector` | off | With `--recreate`, rewrite every file through the global xrootd redirector (`root://xrootd-cms.infn.it//`) without Rucio lookups. Takes precedence over `--blocklist-sites`. |
 | `--blocklist-sites` | — | With `--recreate`, comma-separated CMS/Rucio site names (for example `T2_CH_CERN`) to avoid. XRootD prefixes are resolved from the site map and are not accepted here. Files at a blocklisted site are rewritten to an alternative replica via Rucio. |
-| `--recreate-queue` | — | With `--recreate`, force each resubmitted job's HTCondor `+JobFlavour` to this queue (`espresso` … `nextweek`). Overrides the implicit `--queue-shift` bump for timeout jobs. |
+| `--recreate-queue` | — | With `--recreate`, force each resubmitted job's HTCondor `+JobFlavour` to this queue. Known CERN queues work normally; nonstandard values are warned about and written verbatim. Overrides the implicit `--queue-shift` bump for timeout jobs. |
 | `--skip-bad-files` | off | With `--recreate`, retroactively enable Coffea's skip-bad-files in the inner job by (re)materialising `inner_run_options.yaml` and patching the jobs_dir. |
 | `--remove-running` | off | With `--recreate`, `condor_rm` each recreated job's still-queued (running/idle) HTCondor instance before resubmitting, so a stuck job can't keep running and double-write its output. The instance is matched by the unique `config_job_<n>.pkl` in its lxplus `Args` ClassAd. |
 
@@ -591,6 +591,12 @@ uses the lxplus ClassAd constraint matching the unique `config_job_<n>.pkl` in i
 `Args` ClassAd, verifies `condor_rm` succeeds, and only then submits the replacement.
 `job_1` is never confused with `job_10`.
 
+Without `--resubmit` or `--recreate`, `check-jobs` is read-only: it may infer a
+Condor-log failure for display, but it does not create/remove markers, rewrite
+submit files or pickles, update `job_state.json`, scale resources, or submit/remove
+Condor jobs. Recovery markers and queue/resource changes are materialised only by
+the active recovery modes.
+
 :::{note}
 `--recreate` is locked to the fileset that was pickled in `jobs_config.yaml` at submission
 time; it does not re-read the dataset JSON. To incorporate new files or new sites, rebuild
@@ -605,7 +611,11 @@ For every job whose flag file is `.failed`, `check-jobs` inspects its latest `.o
 The wrapper already retries XRootD failures against alternate sites before exposing a
 failure. A timeout creates a `.timeout` marker; the monitor converts it to `.failed`,
 bumps the job's `+JobFlavour`, and scales its CPU/memory request once. Ordinary repeat
-failures are also escalated after their first resubmission.
+For ordinary non-XRootD failures, the first resubmission keeps the current queue and
+resources; a later failure after a successful resubmission advances the queue and
+applies the one-time CPU/memory scaling. XRootD recovery exhaustion remains an
+unchanged-config retry and does not trigger that escalation. Timeouts follow their
+separate queue/resource escalation path.
 
 For newly created lxplus directories, the monitor writes one `resubmit_now.sub` from
 `resubmit.sub` and `job_state.json`, containing every failed job in that polling pass,
@@ -630,6 +640,17 @@ The one-shot `--recreate` pass re-derives each fileset from scratch out of
 the dynamic state for new directories. Avoid running two `check-jobs --resubmit` or
 `--recreate` processes against the same directory at once — they would issue duplicate
 `condor_submit` calls.
+
+For new manual-job directories, `job_state.json` is authoritative for each job's
+queue, chunksize, CPU count, and memory. Before proactive recreation, the concrete
+`job_i.sub` is materialised from that state, so reactive resource escalation is not
+lost. The submission metadata in `jobs_config.yaml` records whether a grid
+certificate was required and which proxy transfer path was used; legacy directories
+infer the same contract from their submit files.
+
+The timeit rate is measured per worker. LXPLUS runtime forecasts divide the estimated
+event time by the requested worker count when the wrapper selects Futures (`>1` CPU);
+iterative jobs remain single-worker estimates.
 :::
 
 ### Merging skim outputs with a skipped input file

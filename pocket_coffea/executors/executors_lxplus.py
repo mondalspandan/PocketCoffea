@@ -462,8 +462,8 @@ class ExecutorFactoryCondorCERN(ExecutorFactoryManualABC):
             raise click.ClickException("queue_time_threshold_percent must be between 0 and 100")
         return threshold
 
-    @staticmethod
-    def _job_runtime_seconds(filesets, jobs, rates):
+    def _job_runtime_seconds(self, filesets, jobs, rates):
+        workers = max(1, int(self.run_options["cores-per-worker"]))
         job_seconds = []
         for job in jobs:
             seconds = 0.0
@@ -472,7 +472,7 @@ class ExecutorFactoryCondorCERN(ExecutorFactoryManualABC):
                 if nfiles == 0:
                     raise click.ClickException(f"Cannot estimate runtime for empty dataset {dataset!r}")
                 average_events = int(filesets[dataset]["metadata"]["nevents"]) / nfiles
-                seconds += len(split["files"]) * average_events / rates[dataset]
+                seconds += len(split["files"]) * average_events / (rates[dataset] * workers)
             job_seconds.append(seconds)
         return job_seconds
 
@@ -488,6 +488,7 @@ class ExecutorFactoryCondorCERN(ExecutorFactoryManualABC):
             )
 
         rows = []
+        workers = max(1, int(self.run_options["cores-per-worker"]))
         for dataset, fileset in filesets.items():
             rate = rates.get(dataset)
             if rate is None and not auto:
@@ -505,7 +506,7 @@ class ExecutorFactoryCondorCERN(ExecutorFactoryManualABC):
                     seconds = job_seconds[index]
                 else:
                     average_events = int(fileset["metadata"]["nevents"]) / nfiles
-                    seconds = len(job[dataset]["files"]) * average_events / rate
+                    seconds = len(job[dataset]["files"]) * average_events / (rate * workers)
                 candidates.append((seconds, per_job_queue[index]))
             if not candidates:
                 rows.append((1, 0, dataset, None, None))
@@ -559,6 +560,11 @@ class ExecutorFactoryCondorCERN(ExecutorFactoryManualABC):
             "output_dir": os.path.abspath(self.outputdir),
             "split_by_category": self.run_options["split-by-category"],
             "config_pkl_total": f"{os.path.abspath(self.outputdir)}/configurator.pkl",
+            "submission": {
+                "requires_grid_certificate": not self.run_options["ignore-grid-certificate"],
+                "proxy_transfer_path": getattr(self, "x509_path", None),
+                "proxy_source": "explicit" if self.run_options.get("voms-proxy") else "default",
+            },
             "jobs_list": {}
         }
         # Disabling the postprocessing
