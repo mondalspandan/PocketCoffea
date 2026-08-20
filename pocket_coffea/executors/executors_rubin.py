@@ -199,7 +199,7 @@ echo 'Done'"""
             'Executable': "job.sh",
             'Error': f"{abs_jobdir_path}/logs/job_$(ClusterId).$(ProcId).err",
             'Output': f"{abs_jobdir_path}/logs/job_$(ClusterId).$(ProcId).out",
-            'Log': f"{abs_jobdir_path}/logs/job_$(ClusterId).log",
+            'Log': f"{abs_jobdir_path}/logs/job_$(ClusterId).$(ProcId).log",
             'MY.SendCredential': True,
             'MY.SingularityImage': f'"{self.run_options["worker-image"]}"',
             '+MaxRuntime' : self.run_options['max-run-time'],
@@ -242,7 +242,7 @@ echo 'Done'"""
         resubmit_sub.update({
             "Error": f"{abs_jobdir_path}/logs/job_$(ClusterId).$(PROC).err",
             "Output": f"{abs_jobdir_path}/logs/job_$(ClusterId).$(PROC).out",
-            "Log": f"{abs_jobdir_path}/logs/job_$(ClusterId).log",
+            "Log": f"{abs_jobdir_path}/logs/job_$(ClusterId).$(PROC).log",
             "RequestCpus": "$(CPUS)",
             "RequestMemory": "$(MEMORY)",
             "arguments": f"$(PROC) config_job_$(PROC).pkl {abs_output_path} $(CHUNKSIZE)",

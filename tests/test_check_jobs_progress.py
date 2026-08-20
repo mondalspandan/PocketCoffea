@@ -96,7 +96,7 @@ def test_rendered_recovery_uses_exact_state(tmp_path):
         "RequestMemory = $(MEMORY)\n"
         "arguments = $(PROC) $(CHUNKSIZE) $(CPUS)\n"
     )
-    state = check_jobs.load_job_state(tmp_path / "job_state.json")
+    state = json.loads((tmp_path / "job_state.json").read_text())
     state["0"].update({
         "queue": "workday", "request_cpus": 3, "request_memory": "12GB",
         "chunksize": 150,
@@ -115,5 +115,87 @@ def test_unknown_current_queue_is_terminal_fallback(tmp_path):
     make_jobs(tmp_path)
     check_jobs.save_job_state(tmp_path / "job_state.json", state)
     _, _, submission, _, _ = check_jobs.load_current_contract(tmp_path)
-    candidate = check_jobs.candidate_state(state["0"], submission, 1, 2, True)
+    candidate = check_jobs.candidate_state(state["0"], submission, 1, 2)
     assert candidate["queue"] == "nextweek"
+
+
+def test_negative_max_resubmit_is_rejected(tmp_path):
+    result = CliRunner().invoke(
+        check_jobs.check_jobs, ["-j", str(tmp_path), "--max-resubmit", "-1"])
+    assert result.exit_code != 0
+
+
+def test_explicit_active_recreate_has_nonzero_cli_exit(tmp_path):
+    make_jobs(tmp_path)
+    result = CliRunner().invoke(
+        check_jobs.check_jobs, ["-j", str(tmp_path), "--recreate", "0"])
+    assert result.exit_code != 0
+
+
+def test_xrootd_blocklist_value_is_rejected(tmp_path):
+    make_jobs(tmp_path)
+    result = CliRunner().invoke(
+        check_jobs.check_jobs,
+        ["-j", str(tmp_path), "--recreate", "auto", "--blocklist-sites", "root://bad"],
+    )
+    assert result.exit_code != 0
+    assert "CMS/Rucio site names" in result.output
+
+
+def test_aggregate_basic_counts():
+    from pocket_coffea.utils.job_progress import aggregate_by_group
+
+    groups = {"TT": ["job_0", "job_1"], "DATA": ["job_2", "job_3"]}
+    result = aggregate_by_group(groups, ["job_1"], [], ["job_0"], ["job_2"])
+    assert result["TT"]["pct_done"] == 50.0
+    assert result["DATA"]["failed"] == 1
+
+
+def test_aggregate_empty_group_percentage():
+    from pocket_coffea.utils.job_progress import aggregate_by_group
+
+    result = aggregate_by_group({"empty": []}, [], [], [], [])
+    assert result["empty"]["pct_done"] == 0.0
+
+
+def test_aggregate_overlapping_groups():
+    from pocket_coffea.utils.job_progress import aggregate_by_group
+
+    result = aggregate_by_group({"A": ["job_0"], "B": ["job_0"]}, [], [], ["job_0"], [])
+    assert result["A"]["done"] == result["B"]["done"] == 1
+
+
+def test_aggregate_100_percent_completion():
+    from pocket_coffea.utils.job_progress import aggregate_by_group
+
+    result = aggregate_by_group({"A": ["job_0"]}, [], [], ["job_0"], [])
+    assert result["A"]["pct_done"] == 100.0
+
+
+def test_load_job_to_group_map(tmp_path):
+    from pocket_coffea.utils.job_progress import load_job_to_group_map
+
+    (tmp_path / "jobs_config.yaml").write_text(yaml.safe_dump({
+        "jobs_list": {"job_0": {"filesets": {
+            "TT_2023": {"metadata": {"sample": "TT"}, "files": []}
+        }}}
+    }))
+    samples, datasets = load_job_to_group_map(str(tmp_path))
+    assert samples == {"TT": ["job_0"]}
+    assert datasets == {"TT_2023": ["job_0"]}
+
+
+def test_progress_bar_rendering():
+    from pocket_coffea.utils.job_progress import render_progress_bar
+
+    bar = render_progress_bar({"total": 2, "done": 1, "running": 1,
+                               "idle": 0, "failed": 0, "pct_done": 50.0}, width=10)
+    assert bar.count("█") == 10
+
+
+def test_progress_table_overlap_presentation():
+    table = check_jobs.get_progress_table(
+        {"A": {"total": 1, "idle": 0, "running": 0, "done": 1,
+                "failed": 0, "pct_done": 100.0}},
+        "sample", multi_sample_overlap=True)
+    assert "multiple samples" in str(table.title)

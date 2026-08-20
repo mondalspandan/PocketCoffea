@@ -125,8 +125,10 @@ def load_current_contract(jobs_folder):
             if not (folder / name).is_file():
                 raise ValueError
         for job, values in state.items():
-            if not all((folder / f"config_job_{job}.pkl").is_file(),
-                       (folder / f"job_{job}.sub").is_file()):
+            if not (
+                (folder / f"config_job_{job}.pkl").is_file()
+                and (folder / f"job_{job}.sub").is_file()
+            ):
                 raise ValueError
             if not all(key in values for key in
                        ("chunksize", "request_cpus", "request_memory", "resubmissions")):
@@ -136,7 +138,7 @@ def load_current_contract(jobs_folder):
                     ("queue", "base_cpus", "base_memory", "resources_scaled")):
                 raise ValueError
         return folder, metadata, submission, state, state_file
-    except (FileNotFoundError, KeyError, TypeError, ValueError, json.JSONDecodeError):
+    except (FileNotFoundError, KeyError, ValueError, json.JSONDecodeError):
         raise click.UsageError(CONTRACT_ERROR)
 
 
@@ -230,12 +232,6 @@ def apply_condor_log_failures(jobs_folder, findings):
             (Path(jobs_folder) / f"{job}.{marker}").touch()
 
 
-def recover_condor_log_failures(jobs_folder, log_offsets):
-    findings = scan_condor_log_failures(jobs_folder, log_offsets)
-    apply_condor_log_failures(jobs_folder, findings)
-    return len(findings)
-
-
 def merge_inferred_status(idle, running, done, failed, timeout, findings):
     values = [list(value) for value in (idle, running, done, failed, timeout)]
     idle, running, done, failed, timeout = values
@@ -271,17 +267,43 @@ def get_tables(total, idle, running, done, failed, timeout=None, details=False):
     return table, detail
 
 
+def create_layout(with_progress=False):
+    layout = Layout()
+    layout.split_row(Layout(name="left", ratio=2), Layout(name="right", ratio=1))
+    if with_progress:
+        layout["left"].split_column(Layout(name="summary", size=9), Layout(name="progress"))
+    return layout
+
+
 def get_progress_table(group_counts, label, multi_sample_overlap=False, bar_width=30):
-    table = Table(title=f"Progress by {label}")
-    for column in (label.capitalize(), "Total", "Idle", "Running", "Done", "Failed",
-                   "Progress", "% Done"):
-        table.add_column(column, no_wrap=True)
+    title = f"Progress by {label}"
+    if multi_sample_overlap:
+        title += "  [dim](jobs touching multiple samples are counted under each)[/]"
+    table = Table(title=title)
+    table.add_column(label.capitalize(), style="cyan", no_wrap=True)
+    table.add_column("Total", justify="right")
+    table.add_column("Idle", justify="right", style="blue")
+    table.add_column("Running", justify="right", style="magenta")
+    table.add_column("Done", justify="right", style="green")
+    table.add_column("Failed", justify="right", style="red")
+    table.add_column("Progress", justify="left", no_wrap=True)
+    table.add_column("% Done", justify="right")
     for name, counts in sorted(group_counts.items(),
                                key=lambda item: (item[1]["pct_done"], item[0])):
-        table.add_row(name, str(counts["total"]), str(counts["idle"]),
-                      str(counts["running"]), str(counts["done"]),
-                      str(counts["failed"]), render_progress_bar(counts, width=bar_width),
-                      f"{counts['pct_done']:.1f}%")
+        pct = f"{counts['pct_done']:.1f}%" if counts["total"] else "n/a"
+        pct_style = "green" if counts["pct_done"] >= 99.5 else (
+            "yellow" if counts["pct_done"] >= 50 else "red"
+        )
+        table.add_row(
+            name,
+            str(counts["total"]),
+            str(counts["idle"]),
+            str(counts["running"]),
+            str(counts["done"]),
+            str(counts["failed"]),
+            render_progress_bar(counts, width=bar_width),
+            f"[{pct_style}]{pct}[/]",
+        )
     return table
 
 
@@ -333,19 +355,11 @@ def mark_job_failed(jobs_folder, job):
     (Path(jobs_folder) / f"{job}.failed").touch()
 
 
-def load_job_state(state_file):
-    return json.loads(Path(state_file).read_text())
-
-
 def save_job_state(state_file, state):
     state_file = Path(state_file)
     temp = state_file.with_name(f".{state_file.name}.{os.getpid()}.tmp")
     temp.write_text(json.dumps(state, indent=2, sort_keys=True) + "\n")
     os.replace(temp, state_file)
-
-
-def _submission_proxy_contract(jobs_folder):
-    return load_current_contract(jobs_folder)[2]
 
 
 def _atomic_copy_proxy(source, target):
@@ -369,7 +383,7 @@ def _atomic_copy_proxy(source, target):
 
 
 def prepare_proxy_for_jobs(jobs_folder):
-    submission = _submission_proxy_contract(jobs_folder)
+    submission = load_current_contract(jobs_folder)[2]
     if not submission["requires_grid_certificate"]:
         return None
     path = submission["proxy_transfer_path"]
@@ -393,9 +407,9 @@ def scale_memory(memory, factor):
     return f"{float(match.group(1)) * factor:g}{match.group(2)}"
 
 
-def candidate_state(current, submission, queue_shift, ncpu, escalate):
+def candidate_state(current, submission, queue_shift, ncpu):
     candidate = deepcopy(current)
-    if not escalate or not submission["supports_queue_escalation"]:
+    if not submission["supports_queue_escalation"]:
         return candidate
     candidate["queue"] = next_queue(candidate["queue"], queue_shift)
     if not candidate["resources_scaled"]:
@@ -437,10 +451,8 @@ def latest_job_out(jobs_folder, job):
 
 
 def convert_timeout_jobs(jobs_folder, timeout_jobs, running, idle, failed,
-                         queue_shift, ncpu, state, state_file, log_text,
-                         shifted=None, pending=None):
+                         queue_shift, ncpu, state, log_text, pending=None):
     _, _, submission, _, _ = load_current_contract(jobs_folder)
-    shifted = shifted if shifted is not None else set()
     pending = pending if pending is not None else {}
     for job in list(timeout_jobs):
         if job in running:
@@ -450,8 +462,7 @@ def convert_timeout_jobs(jobs_folder, timeout_jobs, running, idle, failed,
         mark_job_failed(jobs_folder, job)
         failed.append(job) if job not in failed else None
         job_num = job.split("_", 1)[1]
-        pending[job] = candidate_state(state[job_num], submission, queue_shift, ncpu, True)
-        shifted.add(job)
+        pending[job] = candidate_state(state[job_num], submission, queue_shift, ncpu)
         log_text.append(
             f"{job} reached the Condor time limit; preparing "
             + ("queue/resource escalation." if submission["supports_queue_escalation"]
@@ -486,7 +497,7 @@ def submit_resubmit_jobs(jobs_folder, job_nums, state, state_file, log_text, pen
 
 def recreate_jobs_oneshot(jobs_folder, jobs_to_recreate, *, use_redirector=False,
                           blocklist_sites=None, recreate_queue=None, skip_bad_files=False,
-                          queue_shift=1, ncpu=1, remove_running=False, dry_run=False):
+                          queue_shift=1, ncpu=1, remove_running=False):
     folder, jobs_config, submission, state, state_file = load_current_contract(jobs_folder)
     result = {"requested": [], "submitted": [], "skipped": [], "failed": {}}
     if recreate_queue is not None and submission["executor"] == "condor@rubin":
@@ -508,6 +519,7 @@ def recreate_jobs_oneshot(jobs_folder, jobs_to_recreate, *, use_redirector=False
         jobs = list(dict.fromkeys(
             item.strip() if item.strip().startswith("job_") else f"job_{item.strip()}"
             for item in jobs_to_recreate.split(",") if item.strip()))
+    explicit = jobs_to_recreate != "auto"
     result["requested"] = jobs
     if not jobs:
         return result
@@ -518,8 +530,11 @@ def recreate_jobs_oneshot(jobs_folder, jobs_to_recreate, *, use_redirector=False
         output = latest_job_out(folder, job)
         if output and extract_failed_url(Path(output).read_text(errors="replace")):
             failed_xrootd.append(job)
-    sitemap = get_xrootd_sites_map() if (failed_xrootd or blocklist) and not use_redirector else None
-    client = get_rucio_client() if sitemap is not None else None
+    sitemap = client = None
+    if (failed_xrootd or blocklist) and not use_redirector:
+        prepare_proxy_for_jobs(folder)
+        sitemap = get_xrootd_sites_map()
+        client = get_rucio_client()
 
     for job in jobs:
         if job not in jobs_config["jobs_list"]:
@@ -527,9 +542,13 @@ def recreate_jobs_oneshot(jobs_folder, jobs_to_recreate, *, use_redirector=False
             continue
         active = (folder / f"{job}.running").exists() or (folder / f"{job}.idle").exists()
         if active and not remove_running:
-            result["skipped"].append(job)
+            if explicit:
+                result["failed"][job] = "job is active; pass --remove-running to recreate it"
+            else:
+                result["skipped"].append(job)
             continue
         config_temp = sub_temp = None
+        backup_path = None
         removed = not active
         try:
             fileset = deepcopy(jobs_config["jobs_list"][job]["filesets"])
@@ -546,39 +565,48 @@ def recreate_jobs_oneshot(jobs_folder, jobs_to_recreate, *, use_redirector=False
             config_path = folder / f"config_{job}.pkl"
             config = cloudpickle.load(config_path.open("rb"))
             config.set_filesets_manually(fileset)
-            config_temp = Path(tempfile.mkstemp(prefix=f".{config_path.name}.", suffix=".tmp", dir=folder)[1])
+            fd, name = tempfile.mkstemp(prefix=f".{config_path.name}.", suffix=".tmp", dir=folder)
+            os.close(fd)
+            config_temp = Path(name)
             with config_temp.open("wb") as handle:
                 cloudpickle.dump(config, handle)
             job_num = job.split("_", 1)[1]
             candidate = deepcopy(state[job_num])
             if (folder / f"{job}.timeout").exists():
-                candidate = candidate_state(candidate, submission, queue_shift, ncpu, True)
+                candidate = candidate_state(candidate, submission, queue_shift, ncpu)
             if recreate_queue is not None:
                 candidate["queue"] = recreate_queue
             row = {"PROC": job_num, "CHUNKSIZE": candidate["chunksize"],
                    "CPUS": candidate["request_cpus"], "MEMORY": candidate["request_memory"]}
             if submission["executor"] == "condor@lxplus":
                 row["QUEUE"] = candidate["queue"]
-            sub_temp = Path(tempfile.mkstemp(prefix=f".{job}.", suffix=".sub", dir=folder)[1])
+            fd, name = tempfile.mkstemp(prefix=f".{job}.", suffix=".sub", dir=folder)
+            os.close(fd)
+            sub_temp = Path(name)
             sub_temp.write_text(render_condor_submit(
                 (folder / "resubmit.sub").read_text(), [row], submission["executor"]))
             prepare_proxy_for_jobs(folder)
-            if active and remove_running and not dry_run:
+            if active and remove_running:
                 ok, output = condor_rm_job(job)
                 if not ok:
                     raise RuntimeError(f"condor_rm failed: {output}")
                 if not wait_for_condor_job_removal(job):
                     raise RuntimeError("could not confirm Condor removal")
                 removed = True
-            if dry_run:
-                result["skipped"].append(job)
-                continue
+
+            backup_path = config_path.with_name(f".{config_path.name}.{os.getpid()}.bak")
+            os.replace(config_path, backup_path)
+            os.replace(config_temp, config_path)
             ok, output = condor_submit_job(folder, sub_temp.name)
             if not ok:
+                config_path.unlink(missing_ok=True)
+                os.replace(backup_path, config_path)
+                backup_path = None
                 mark_job_failed(folder, job)
                 result["failed"][job] = output or "condor_submit failed"
                 continue
-            os.replace(config_temp, config_path)
+            backup_path.unlink(missing_ok=True)
+            backup_path = None
             os.replace(sub_temp, folder / f"{job}.sub")
             candidate["resubmissions"] = int(state[job_num]["resubmissions"]) + 1
             state[job_num] = candidate
@@ -586,6 +614,9 @@ def recreate_jobs_oneshot(jobs_folder, jobs_to_recreate, *, use_redirector=False
             mark_job_idle(folder, job)
             result["submitted"].append(job)
         except Exception as exc:
+            if backup_path and backup_path.exists():
+                config_path.unlink(missing_ok=True)
+                os.replace(backup_path, config_path)
             result["failed"][job] = str(exc)
             if removed:
                 mark_job_failed(folder, job)
@@ -608,7 +639,7 @@ def recreate_jobs_oneshot(jobs_folder, jobs_to_recreate, *, use_redirector=False
 @click.option("-j", "--jobs-folder", required=True, type=str)
 @click.option("-d", "--details", is_flag=True)
 @click.option("-r", "--resubmit", is_flag=True)
-@click.option("-m", "--max-resubmit", type=int, default=4)
+@click.option("-m", "--max-resubmit", type=click.IntRange(min=0), default=4)
 @click.option("-q", "--queue-shift", type=click.IntRange(min=0), default=1)
 @click.option("-n", "--ncpu", type=click.IntRange(min=1), default=1)
 @click.option("--by", "group_by", type=click.Choice(["sample", "dataset", "none"]), default="sample")
@@ -624,19 +655,29 @@ def check_jobs(jobs_folder, details, resubmit, max_resubmit, queue_shift, ncpu, 
                recreate, once, use_redirector, blocklist_sites, recreate_queue,
                skip_bad_files, remove_running):
     folder, config, submission, state, state_file = load_current_contract(jobs_folder)
+    blocklist = (
+        [site.strip() for site in blocklist_sites.split(",") if site.strip()]
+        if blocklist_sites else []
+    )
+    invalid = [site for site in blocklist if site.startswith("root://")]
+    if invalid:
+        raise click.BadParameter(
+            "--blocklist-sites accepts CMS/Rucio site names, not XRootD prefixes"
+        )
     if recreate is None and any((use_redirector, blocklist_sites, recreate_queue,
                                  skip_bad_files, remove_running)):
         raise click.UsageError("recreate-only options require --recreate")
     if recreate is not None:
         result = recreate_jobs_oneshot(
             folder, recreate, use_redirector=use_redirector,
-            blocklist_sites=(blocklist_sites or "").split(","),
+            blocklist_sites=blocklist,
             recreate_queue=recreate_queue, skip_bad_files=skip_bad_files,
             queue_shift=queue_shift, ncpu=ncpu, remove_running=remove_running)
         if result["failed"]:
             raise click.exceptions.Exit(1)
         if not resubmit:
             return
+        folder, config, submission, state, state_file = load_current_contract(folder)
 
     total = [f"job_{job}" for job in state]
     groups = None
@@ -649,11 +690,8 @@ def check_jobs(jobs_folder, details, resubmit, max_resubmit, queue_shift, ncpu, 
             listed = [job for jobs in groups.values() for job in jobs]
             overlap = len(listed) != len(set(listed))
 
-    layout = Layout()
-    layout.split_row(Layout(name="left", ratio=2), Layout(name="right", ratio=1))
-    if groups is not None:
-        layout["left"].split_column(Layout(name="summary", size=9), Layout(name="progress"))
-    log_text, offsets, pending, shifted, definitive = [], {}, {}, set(), set()
+    layout = create_layout(with_progress=groups is not None)
+    log_text, offsets, pending, definitive = [], {}, {}, set()
 
     def refresh(idle, running, done, failed, timeout):
         summary, _ = get_tables(total, idle, running, done, failed, timeout, details)
@@ -674,7 +712,7 @@ def check_jobs(jobs_folder, details, resubmit, max_resubmit, queue_shift, ncpu, 
                 apply_condor_log_failures(folder, findings)
                 idle, running, done, failed, timeout = check_jobs_logs(folder)
                 convert_timeout_jobs(folder, timeout, running, idle, failed, queue_shift, ncpu,
-                                     state, state_file, log_text, shifted, pending)
+                                     state, log_text, pending)
             else:
                 idle, running, done, failed, timeout = merge_inferred_status(
                     idle, running, done, failed, timeout, findings)
@@ -692,9 +730,9 @@ def check_jobs(jobs_folder, details, resubmit, max_resubmit, queue_shift, ncpu, 
                     if attempts >= max_resubmit:
                         definitive.add(job)
                         continue
-                    if (attempts >= 1 and job not in timeout and job not in shifted
-                            and job not in pending and not is_xrootd_exhaustion_log(out_text)):
-                        pending[job] = candidate_state(state[number], submission, queue_shift, ncpu, True)
+                    if (attempts >= 1 and job not in timeout and job not in pending
+                            and not is_xrootd_exhaustion_log(out_text)):
+                        pending[job] = candidate_state(state[number], submission, queue_shift, ncpu)
                     resubmit_now.append(number)
             if resubmit_now:
                 successful = submit_resubmit_jobs(folder, resubmit_now, state, state_file, log_text, pending)
