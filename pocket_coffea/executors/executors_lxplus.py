@@ -6,6 +6,7 @@ from .executors_base import ExecutorFactoryABC
 from .executors_manual_jobs import (
     ExecutorFactoryManualABC,
     write_inner_run_options,
+    render_condor_submit,
 )
 from .executors_base import IterativeExecutorFactory, FuturesExecutorFactory
 from pocket_coffea.utils.network import check_port
@@ -16,6 +17,7 @@ import cloudpickle
 import yaml
 import json
 import multiprocessing as mp
+from pathlib import Path
 from statistics import median
 import click
 from rich.console import Console
@@ -561,9 +563,15 @@ class ExecutorFactoryCondorCERN(ExecutorFactoryManualABC):
             "split_by_category": self.run_options["split-by-category"],
             "config_pkl_total": f"{os.path.abspath(self.outputdir)}/configurator.pkl",
             "submission": {
+                "format_version": 1,
+                "executor": "condor@lxplus",
                 "requires_grid_certificate": not self.run_options["ignore-grid-certificate"],
                 "proxy_transfer_path": getattr(self, "x509_path", None),
-                "proxy_source": "explicit" if self.run_options.get("voms-proxy") else "default",
+                "proxy_source": (
+                    None if self.run_options["ignore-grid-certificate"]
+                    else "explicit" if self.run_options.get("voms-proxy") else "default"
+                ),
+                "supports_queue_escalation": True,
             },
             "jobs_list": {}
         }
@@ -692,7 +700,7 @@ class ExecutorFactoryCondorCERN(ExecutorFactoryManualABC):
         with open(f"{self.jobs_dir}/job.sh", "w") as f:
             f.write(script)
 
-        # Resolve per-job chunksize. Accepts a scalar (legacy) or a per-sample dict.
+        # Resolve per-job chunksize. Accepts a scalar or a per-sample dict.
         # See ExecutorFactoryManualABC._resolve_chunksize_for_job.
         chunksize_cfg = self.run_options['chunksize']
         self._validate_chunksize_keys(chunksize_cfg, self.filesets)
@@ -770,18 +778,21 @@ class ExecutorFactoryCondorCERN(ExecutorFactoryManualABC):
                 f.write(f"{k} = {v}\n")
 
         # Keep one concrete submit file per job for check-jobs --recreate and
-        # for compatibility with job directories created before dynamic batching.
-        print(f"Creating {len(jobs_config)} .sub files for proactive recreation.")
-        for i, _ in enumerate(jobs_config):
+        # for proactive recreation and current-format inspection.
+        print(f"Creating {len(per_job_chunksize)} .sub files for proactive recreation.")
+        for i, _ in enumerate(per_job_chunksize):
+            row = {
+                "PROC": i,
+                "QUEUE": per_job_queue[i],
+                "CHUNKSIZE": per_job_chunksize[i],
+                "CPUS": self.run_options["cores-per-worker"],
+                "MEMORY": self.run_options["mem-per-worker"],
+            }
             with open(f"{self.jobs_dir}/job_{i}.sub", "w") as f:
-                for key, value in sub.items():
-                    if isinstance(value, str):
-                        value = value.replace("$(ProcId)", str(i))
-                        value = value.replace("$(ClusterId).log", f"$(ClusterId).{i}.log")
-                        value = value.replace("$(chunksize)", str(per_job_chunksize[i]))
-                        value = value.replace("$(QUEUE)", per_job_queue[i])
-                    f.write(f"{key} = {value}\n")
-                f.write("queue\n")
+                f.write(render_condor_submit(
+                    Path(f"{self.jobs_dir}/resubmit.sub").read_text(),
+                    [row], "condor@lxplus"
+                ))
             # Let's also create a .idle file to indicate the the job is in idle
             with open(f"{self.jobs_dir}/job_{i}.idle", "w") as f:
                 f.write("")

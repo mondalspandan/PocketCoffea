@@ -194,12 +194,6 @@ def run(cfg,  custom_run_options, outputdir, test, limit_files, limit_samples,
             run_options["limit-files"] = None
             run_options["limit-chunks"] = 1 if executor in ("iterative", "futures") else None
 
-    if timeit and not run_options.get("_timeit-worker", False):
-        config.filter_dataset_by_events(run_options["chunksize"])
-    elif not timeit and limit_files!=None:
-        run_options["limit-files"] = limit_files
-        config.filter_dataset(run_options["limit-files"])
-
     # The manual-job recreate/resubmit path moved to `pocket-coffea check-jobs`.
     # These flags used to be handled here. Fail loudly with a pointer instead of
     # silently ignoring them.
@@ -219,7 +213,6 @@ def run(cfg,  custom_run_options, outputdir, test, limit_files, limit_samples,
         if not timeit:
             run_options["limit-files"] = limit_files if limit_files else 2
             run_options["limit-chunks"] = limit_chunks if limit_chunks else 2
-            config.filter_dataset(run_options["limit-files"])
 
     # Filter on the fly the fileset to process by datataking period
     filesets_to_run = config.filesets
@@ -234,6 +227,17 @@ def run(cfg,  custom_run_options, outputdir, test, limit_files, limit_samples,
         filesets_to_run = {dataset: files for dataset, files in filesets_to_run.items() if dataset in filter_datasets}
     if limit_samples is not None:
         filesets_to_run = dict(list(filesets_to_run.items())[:limit_samples])
+    config.set_filesets_manually(filesets_to_run)
+
+    outer_timeit = timeit and not run_options.get("_timeit-worker", False)
+    if outer_timeit:
+        config.filter_dataset_by_events(run_options["chunksize"])
+    elif not timeit:
+        selected_limit = limit_files if limit_files is not None else (2 if test else None)
+        if selected_limit is not None:
+            run_options["limit-files"] = selected_limit
+            config.filter_dataset(selected_limit)
+    filesets_to_run = config.filesets
     # Run option display
     table = Table(title="Run Configuration")
     table.add_column("Option", style="cyan")
