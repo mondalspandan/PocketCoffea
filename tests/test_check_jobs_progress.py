@@ -243,7 +243,7 @@ def test_stale_condor_abort_is_ignored_after_resubmission(tmp_path):
     assert not (tmp_path / "job_0.failed").exists()
 
 
-def test_same_second_condor_abort_is_current(tmp_path):
+def test_same_second_condor_abort_is_ambiguous_and_ignored(tmp_path):
     from pocket_coffea.scripts.check_jobs import recover_condor_log_failures
 
     now = int(time.time())
@@ -255,8 +255,8 @@ def test_same_second_condor_abort_is_current(tmp_path):
     stamp = time.strftime("%m/%d %H:%M:%S", time.localtime(now))
     (logs / "job_123.log").write_text(_condor_abort(0, stamp))
 
-    assert recover_condor_log_failures(tmp_path, {}) == 1
-    assert (tmp_path / "job_0.failed").exists()
+    assert recover_condor_log_failures(tmp_path, {}) == 0
+    assert not (tmp_path / "job_0.failed").exists()
 
 
 def test_resubmission_log_uses_filename_job_number(tmp_path):
@@ -435,9 +435,11 @@ def test_convert_timeout_jobs_bumps_queue_and_marks_failed(tmp_path):
     state_file.write_text(json.dumps(job_state))
     log_text = []
 
+    pending = {}
     converted = convert_timeout_jobs(
         tmp_path, ["job_0"], ["job_0"], [], [], queue_shift=1, ncpu=3,
         job_state=job_state, state_file=state_file, log_text=log_text,
+        pending_candidates=pending,
     )
 
     assert converted == 1
@@ -445,9 +447,10 @@ def test_convert_timeout_jobs_bumps_queue_and_marks_failed(tmp_path):
     assert not (tmp_path / "job_0.running").exists()
     assert (tmp_path / "job_0.failed").exists()
     persisted = json.loads(state_file.read_text())
-    assert persisted["0"]["queue"] == "microcentury"
-    assert persisted["0"]["request_cpus"] == 6
-    assert persisted["0"]["request_memory"] == "12GB"
+    assert persisted["0"]["queue"] == "espresso"
+    assert pending["job_0"]["state"]["queue"] == "microcentury"
+    assert pending["job_0"]["state"]["request_cpus"] == 6
+    assert pending["job_0"]["state"]["request_memory"] == "12GB"
     assert "time limit" in log_text[-1]
 
 

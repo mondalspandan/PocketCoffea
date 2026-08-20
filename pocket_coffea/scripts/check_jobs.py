@@ -12,10 +12,12 @@ The status of the jobs can be checked by looking at the file in the jobs folder.
 '''
 
 import os
+import shutil
 import fcntl
 import socket
 import subprocess
 import sys
+import tempfile
 import uuid
 import yaml
 import cloudpickle
@@ -54,6 +56,7 @@ LOCK_FILENAME = ".check_jobs.lock"
 JOB_MARKERS = ("idle", "running", "done", "failed", "timeout")
 CONDOR_REMOVAL_TIMEOUT = 10.0
 RESOURCE_SCALED_MARKER = "# check-jobs-resources-scaled"
+ATTEMPT_STATE_FILENAME = "check_jobs_state.json"
 
 
 def _resolve_jobs_folder(jobs_folder):
@@ -305,7 +308,9 @@ def scan_condor_log_failures(jobs_folder, log_offsets):
                      event_base + 365 * 24 * 3600),
                     key=lambda candidate: abs(candidate - marker_time),
                 )
-                if event_time >= int(marker_time) and (
+                # Condor logs have second precision while marker mtimes do not;
+                # equality is ambiguous and is conservatively ignored.
+                if event_time > int(marker_time) and (
                         job not in recovered or event_time > recovered[job][0]):
                     recovered[job] = (event_time, reason)
             log_offsets[key] = handle.tell()
@@ -501,10 +506,13 @@ def recreate_jobs_oneshot(jobs_folder, jobs_to_recreate, *, use_redirector=False
     instance can't keep running and double-write its output.
     """
     jobs_folder = Path(jobs_folder)
+    result = {"requested": [], "submitted": [], "skipped": [], "failed": {}}
     jobs_config_path = jobs_folder / "jobs_config.yaml"
     if not jobs_config_path.exists():
-        rprint(f"[red]No jobs_config.yaml found in {jobs_folder}. Cannot recreate jobs.[/]")
-        return
+        message = f"No jobs_config.yaml found in {jobs_folder}"
+        rprint(f"[red]{message}. Cannot recreate jobs.[/]")
+        result["failed"]["jobs_config"] = message
+        return result
     with open(jobs_config_path) as f:
         jobs_config = yaml.safe_load(f)
     state_file = jobs_folder / "job_state.json"
@@ -547,7 +555,7 @@ def recreate_jobs_oneshot(jobs_folder, jobs_to_recreate, *, use_redirector=False
         if not jobs_to_redo:
             rprint(f"[green]No *.failed/*.running/*.idle/*.timeout jobs found in {jobs_folder}; "
                    f"nothing to recreate.[/]")
-            return
+            return result
     else:
         jobs_to_redo = []
         for j in jobs_to_recreate.split(","):
@@ -563,6 +571,7 @@ def recreate_jobs_oneshot(jobs_folder, jobs_to_recreate, *, use_redirector=False
         idlejobs = [j for j in jobs_to_redo if (jobs_folder / f"{j}.idle").exists()]
         timeoutjobs = [j for j in jobs_to_redo if (jobs_folder / f"{j}.timeout").exists()]
     rprint(f"Recreating jobs: {jobs_to_redo}")
+    result["requested"] = list(jobs_to_redo)
 
     # Jobs that failed due to an XRootD error get a per-file alternate-site lookup.
     xrootd_fail_jobs = []
@@ -598,79 +607,135 @@ def recreate_jobs_oneshot(jobs_folder, jobs_to_recreate, *, use_redirector=False
 
     for job in jobs_to_redo:
         if job not in jobs_config["jobs_list"]:
-            rprint(f"[yellow]Job {job} not found in jobs_config.yaml; skipping.[/]")
+            message = "job is not present in jobs_config.yaml"
+            result["failed"][job] = message
+            rprint(f"[red]{job}: {message}[/]")
             continue
 
         active = job in set(runningjobs) | set(idlejobs)
         if active and not remove_running:
             rprint(f"[yellow]Refusing to recreate active {job}; pass --remove-running "
                    "to remove its existing HTCondor job first.[/]")
+            result["skipped"].append(job)
             continue
-        if active and not dry_run:
-            removed, output = condor_rm_job(job)
-            rprint(f"[recreate] condor_rm {job}: {output or 'no output'}")
-            if not removed:
-                rprint(f"[red]Could not remove {job}; leaving markers and skipping resubmission.[/]")
-                continue
-            if not wait_for_condor_job_removal(job):
-                rprint(f"[red]Could not confirm removal of {job}; skipping resubmission.[/]")
-                continue
 
         # Source the ORIGINAL fileset from jobs_config.yaml (from-scratch) so
-        # repeated recreates don't compound rewrites.
-        new_fileset = deepcopy(jobs_config["jobs_list"][job]["filesets"])
-        if use_redirector:
-            new_fileset = rewrite_fileset_to_redirector(new_fileset)
-        else:
-            if job in xrootd_fail_jobs:
-                rprint(f"Replacing input files in {job} since it failed due to an XRootD error.")
-                for sample, dct in new_fileset.items():
-                    dct['files'] = [
-                        find_other_file(fl, sitemap, blocklist=blocklist_sites,
-                                        rucio_client=rucio_client)
-                        for fl in dct['files']
-                    ]
-            if blocklist_sites:
-                new_fileset = rewrite_fileset_blocklist(new_fileset, sitemap, blocklist_sites,
-                                                        rucio_client=rucio_client)
+        # repeated recreates don't compound rewrites. All rewrite errors are
+        # per-job failures and occur before any scheduler removal.
+        cfg_tmp = None
+        sub_tmp = None
+        try:
+            new_fileset = deepcopy(jobs_config["jobs_list"][job]["filesets"])
+            if use_redirector:
+                new_fileset = rewrite_fileset_to_redirector(new_fileset)
+            else:
+                if job in xrootd_fail_jobs:
+                    rprint(f"Replacing input files in {job} since it failed due to an XRootD error.")
+                    for sample, dct in new_fileset.items():
+                        dct['files'] = [
+                            find_other_file(fl, sitemap, blocklist=blocklist_sites,
+                                            rucio_client=rucio_client)
+                            for fl in dct['files']
+                        ]
+                if blocklist_sites:
+                    new_fileset = rewrite_fileset_blocklist(new_fileset, sitemap, blocklist_sites,
+                                                            rucio_client=rucio_client)
 
-        cfgfile = f"{jobs_folder}/config_{job}.pkl"
-        config = cloudpickle.load(open(cfgfile, "rb"))
-        config.set_filesets_manually(new_fileset)
-        cloudpickle.dump(config, open(cfgfile, "wb"))
+            # Prepare every replacement artifact in memory/temporary files. In
+            # particular, do not touch the durable pickle or submit file while
+            # an active scheduler instance could still be using them.
+            cfgfile = jobs_folder / f"config_{job}.pkl"
+            config = cloudpickle.load(cfgfile.open("rb"))
+            config.set_filesets_manually(new_fileset)
+            cfg_tmp = Path(tempfile.mkstemp(
+                prefix=f".{cfgfile.name}.", suffix=".tmp", dir=jobs_folder)[1])
+            with cfg_tmp.open("wb") as handle:
+                cloudpickle.dump(config, handle)
 
-        if skip_bad_files and ensure_sub_transfers is not None:
-            ensure_sub_transfers(f"{jobs_folder}/{job}.sub", abs_jobdir)
+            subfile = jobs_folder / f"{job}.sub"
+            sub_text = subfile.read_text()
+            job_num = job.split("_", 1)[1]
+            candidate_state = None
+            if job_state is not None and job_num in job_state:
+                candidate_state = deepcopy(job_state[job_num])
+                if job in timeoutjobs:
+                    candidate_state = _candidate_dynamic_state(job_state, job_num,
+                                                               0 if recreate_queue is not None else queue_shift, ncpu)
+                if recreate_queue is not None:
+                    candidate_state["queue"] = recreate_queue
+                final_sub_text = _materialize_submit_text(sub_text, candidate_state)
+            else:
+                final_sub_text = sub_text
+                if job in timeoutjobs:
+                    final_sub_text, _ = _candidate_legacy_text(
+                        final_sub_text, 0 if recreate_queue is not None else queue_shift, ncpu)
+                if recreate_queue is not None:
+                    final_sub_text = re.sub(r"^.*\+JobFlavour.*$",
+                                            f'+JobFlavour="{recreate_queue}"',
+                                            final_sub_text, count=1, flags=re.MULTILINE)
 
-        # Explicit queue override wins over the implicit timeout queue bump,
-        # but timeout resource scaling still applies.
-        selected_queue = None
-        if job in timeoutjobs:
-            selected_queue = escalate_timeout_job(
-                jobs_folder, job, job_state, state_file,
-                0 if recreate_queue is not None else queue_shift, ncpu,
-            )
-        if recreate_queue is not None:
-            set_queue(f"{jobs_folder}/{job}.sub", recreate_queue, job)
-            selected_queue = recreate_queue
+            if skip_bad_files and ensure_sub_transfers is not None:
+                sub_tmp = Path(tempfile.mkstemp(
+                    prefix=f".{subfile.name}.", suffix=".tmp", dir=jobs_folder)[1])
+                sub_tmp.write_text(final_sub_text)
+                ensure_sub_transfers(str(sub_tmp), abs_jobdir)
+                final_sub_text = sub_tmp.read_text()
+                sub_tmp.unlink()
 
-        if selected_queue is not None:
-            sync_dynamic_queue(jobs_folder, job, selected_queue, job_state, state_file)
+            # This is deliberately before condor_rm: a missing/expired proxy
+            # must never kill the old active attempt.
+            if not dry_run:
+                prepare_proxy_for_jobs(jobs_folder)
+            sub_tmp = Path(tempfile.mkstemp(
+                prefix=f".{subfile.name}.", suffix=".tmp", dir=jobs_folder)[1])
+            sub_tmp.write_text(final_sub_text)
 
-        if job_state is not None and job.split("_", 1)[1] in job_state:
-            materialize_job_submit_state(jobs_folder, job.split("_", 1)[1], job_state)
+            if active and not dry_run:
+                removed, output = condor_rm_job(job)
+                rprint(f"[recreate] condor_rm {job}: {output or 'no output'}")
+                if not removed:
+                    raise RuntimeError("condor_rm failed; old job was left in place")
+                if not wait_for_condor_job_removal(job):
+                    raise RuntimeError("could not confirm Condor removal")
 
-        if dry_run:
-            rprint(f"[dim]Dry run, not resubmitting {job}[/]")
-            continue
-        prepare_proxy_for_jobs(jobs_folder)
-        submitted, output = condor_submit_job(jobs_folder, f"{job}.sub")
-        if submitted:
+            os.replace(cfg_tmp, cfgfile)
+            os.replace(sub_tmp, subfile)
+            if dry_run:
+                rprint(f"[dim]Dry run, not resubmitting {job}[/]")
+                result["skipped"].append(job)
+                continue
+
+            submitted, output = condor_submit_job(jobs_folder, subfile.name)
+            if not submitted:
+                mark_job_failed(jobs_folder, job)
+                result["failed"][job] = output or "condor_submit failed"
+                rprint(f"[red]Failed to resubmit {job}: {output or 'condor_submit failed'}[/]")
+                continue
+            if candidate_state is not None:
+                job_state[job_num] = candidate_state
+                save_job_state(state_file, job_state)
+                materialize_job_submit_state(jobs_folder, job_num, job_state)
+            _record_attempt(jobs_folder, job_num, job_state, state_file)
             mark_job_idle(jobs_folder, job)
+            result["submitted"].append(job)
             rprint(f"[green]Resubmitted {job}: {output or 'submitted'}[/]")
-        else:
-            mark_job_failed(jobs_folder, job)
-            rprint(f"[red]Failed to resubmit {job}: {output or 'condor_submit failed'}[/]")
+        except Exception as exc:
+            result["failed"][job] = str(exc)
+            rprint(f"[red]{job}: {exc}[/]")
+            for temporary in jobs_folder.glob(f".{job}.*.tmp"):
+                temporary.unlink(missing_ok=True)
+            if cfg_tmp is not None:
+                cfg_tmp.unlink(missing_ok=True)
+            if sub_tmp is not None:
+                sub_tmp.unlink(missing_ok=True)
+
+    rprint("Recreate summary:")
+    rprint(f"  submitted: {len(result['submitted'])}")
+    rprint(f"  skipped:   {len(result['skipped'])}")
+    rprint(f"  failed:    {len(result['failed'])}")
+    for job, message in result["failed"].items():
+        rprint(f"{job}: {message}")
+    return result
 
 
 
@@ -706,19 +771,34 @@ def _submission_proxy_contract(jobs_folder):
             if not line.startswith("transfer_input_files"):
                 continue
             values = line.split("=", 1)[1].strip().split(",")
-            candidates = [
-                value.strip().strip('"') for value in values
-                if "config_job_" not in value
-                and not value.endswith("job.sh")
-                and not value.endswith("inner_run_options.yaml")
-            ]
-            if candidates:
-                candidate = candidates[0]
+            candidates = []
+            for value in values:
+                value = value.strip().strip('"')
+                base = os.path.basename(value)
+                if (re.fullmatch(r"config_job_.*\.pkl", base)
+                        or base == "job.sh" or base == "inner_run_options.yaml"):
+                    continue
+                candidates.append(value)
+            likely = [value for value in candidates
+                      if re.search(r"(?:x509|proxy)", os.path.basename(value), re.I)]
+            if len(likely) == 1:
+                candidate = likely[0]
                 default_proxy = os.path.basename(candidate).startswith("x509")
                 return {
                     "requires_grid_certificate": True,
                     "proxy_transfer_path": candidate,
                     "proxy_source": "default" if default_proxy else "legacy",
+                }
+            if len(likely) > 1 or len(candidates) > 1:
+                raise RuntimeError(
+                    "Cannot unambiguously infer the X509 proxy from this legacy submit file."
+                )
+            if candidates:
+                candidate = candidates[0]
+                return {
+                    "requires_grid_certificate": True,
+                    "proxy_transfer_path": candidate,
+                    "proxy_source": "legacy",
                 }
             return {
                 "requires_grid_certificate": False,
@@ -730,6 +810,30 @@ def _submission_proxy_contract(jobs_folder):
         "proxy_transfer_path": None,
         "proxy_source": None,
     }
+
+
+def _atomic_copy_proxy(source, target):
+    source = os.path.abspath(os.path.expandvars(source))
+    target = os.path.abspath(os.path.expandvars(target))
+    if source == target:
+        if not os.path.exists(target):
+            raise RuntimeError(f"Required proxy transfer path does not exist: {target}")
+        os.chmod(target, 0o600)
+        return
+    parent = os.path.dirname(target) or "."
+    os.makedirs(parent, exist_ok=True)
+    temporary = os.path.join(parent, f".{os.path.basename(target)}.{os.getpid()}.tmp")
+    try:
+        with open(source, "rb") as src, open(temporary, "wb") as dst:
+            shutil.copyfileobj(src, dst)
+        os.chmod(temporary, 0o600)
+        os.replace(temporary, target)
+        os.chmod(target, 0o600)
+    finally:
+        try:
+            os.unlink(temporary)
+        except FileNotFoundError:
+            pass
 
 
 def prepare_proxy_for_jobs(jobs_folder):
@@ -746,22 +850,53 @@ def prepare_proxy_for_jobs(jobs_folder):
         source = get_proxy_path()
         os.makedirs(os.path.dirname(proxy_path) or ".", exist_ok=True)
         if os.path.abspath(source) != os.path.abspath(proxy_path):
-            import shutil
-            shutil.copyfile(source, proxy_path)
+            _atomic_copy_proxy(source, proxy_path)
     if not os.path.exists(proxy_path):
         raise RuntimeError(f"Required proxy transfer path does not exist: {proxy_path}")
+    os.chmod(proxy_path, 0o600)
     os.environ["X509_USER_PROXY"] = proxy_path
     return proxy_path
 
 
-def materialize_job_submit_state(jobs_folder, job_num, job_state):
-    """Rewrite a concrete submit file from the authoritative per-job state."""
-    state = job_state[str(job_num)]
-    sub_file = Path(jobs_folder) / f"job_{job_num}.sub"
-    if not sub_file.exists():
-        return False
+def _attempt_state_path(jobs_folder):
+    return Path(jobs_folder) / ATTEMPT_STATE_FILENAME
+
+
+def _load_attempt_state(jobs_folder):
+    path = _attempt_state_path(jobs_folder)
+    if not path.exists():
+        return {}
+    with path.open() as handle:
+        return json.load(handle)
+
+
+def _save_attempt_state(jobs_folder, state):
+    path = _attempt_state_path(jobs_folder)
+    temporary = path.with_suffix(f".{os.getpid()}.tmp")
+    with temporary.open("w") as handle:
+        json.dump(state, handle, indent=2, sort_keys=True)
+    os.replace(temporary, path)
+
+
+def _attempts(jobs_folder, job_num, job_state):
+    if job_state is not None and str(job_num) in job_state:
+        return int(job_state[str(job_num)].get("resubmissions", 0))
+    return int(_load_attempt_state(jobs_folder).get(str(job_num), {}).get("resubmissions", 0))
+
+
+def _record_attempt(jobs_folder, job_num, job_state, state_file):
+    if job_state is not None and str(job_num) in job_state:
+        job_state[str(job_num)]["resubmissions"] = _attempts(jobs_folder, job_num, job_state) + 1
+        save_job_state(state_file, job_state)
+        return
+    state = _load_attempt_state(jobs_folder)
+    state.setdefault(str(job_num), {})["resubmissions"] = _attempts(jobs_folder, job_num, None) + 1
+    _save_attempt_state(jobs_folder, state)
+
+
+def _materialize_submit_text(text, state):
     lines = []
-    for line in sub_file.read_text().splitlines(keepends=True):
+    for line in text.splitlines(keepends=True):
         stripped = line.strip()
         if "+JobFlavour" in line and state.get("queue") is not None:
             line = f'+JobFlavour="{state["queue"]}"\n'
@@ -776,7 +911,16 @@ def materialize_job_submit_state(jobs_folder, job_num, job_state):
                 line,
             )
         lines.append(line)
-    sub_file.write_text("".join(lines))
+    return "".join(lines)
+
+
+def materialize_job_submit_state(jobs_folder, job_num, job_state):
+    """Rewrite a concrete submit file from the authoritative per-job state."""
+    state = job_state[str(job_num)]
+    sub_file = Path(jobs_folder) / f"job_{job_num}.sub"
+    if not sub_file.exists():
+        return False
+    sub_file.write_text(_materialize_submit_text(sub_file.read_text(), state))
     return True
 
 
@@ -838,12 +982,56 @@ def scale_submit_resources(sub_file, factor):
     return True
 
 
+def _candidate_dynamic_state(job_state, job_num, queue_shift, ncpu):
+    candidate = deepcopy(job_state[str(job_num)])
+    candidate["queue"] = next_queue(candidate["queue"], queue_shift)
+    if not candidate.get("resources_scaled", False):
+        candidate["request_cpus"] = int(candidate["base_cpus"]) * ncpu
+        candidate["request_memory"] = scale_memory(candidate["base_memory"], ncpu)
+        candidate["resources_scaled"] = True
+    return candidate
+
+
+def _candidate_legacy_text(sub_text, queue_shift, ncpu):
+    queue = None
+    for line in sub_text.splitlines():
+        if "+JobFlavour" in line:
+            queue = line.split("=", 1)[1].strip().replace('"', '')
+            break
+    candidate_queue = next_queue(queue, queue_shift) if queue is not None else None
+    text = sub_text
+    if candidate_queue is not None:
+        text = re.sub(r"^.*\+JobFlavour.*$", f'+JobFlavour="{candidate_queue}"', text, count=1, flags=re.MULTILINE)
+    if RESOURCE_SCALED_MARKER not in text:
+        cpus_match = re.search(r"^RequestCpus\s*=\s*(\d+)\s*$", text, re.MULTILINE)
+        memory_match = re.search(r"^RequestMemory\s*=\s*(\S+)\s*$", text, re.MULTILINE)
+        if cpus_match and memory_match:
+            cpus = int(cpus_match.group(1)) * ncpu
+            memory = scale_memory(memory_match.group(1), ncpu)
+            text = re.sub(r"^RequestCpus\s*=.*$", f"RequestCpus = {cpus}", text, count=1, flags=re.MULTILINE)
+            text = re.sub(r"^RequestMemory\s*=.*$", f"RequestMemory = {memory}", text, count=1, flags=re.MULTILINE)
+            lines = text.splitlines()
+            for i, line in enumerate(lines):
+                if line.strip().startswith("arguments") and "$(CPUS)" not in line:
+                    lines[i] = re.sub(r"\s+\d+\s*$", f" {cpus}", line)
+                    break
+            text = "\n".join(lines) + ("\n" if sub_text.endswith("\n") else "")
+            text += RESOURCE_SCALED_MARKER + "\n"
+    return text, candidate_queue
+
+
 def escalate_timeout_job(jobs_folder, job, job_state, state_file, queue_shift, ncpu):
+    """Compatibility helper that commits a timeout escalation immediately."""
     job_num = job.split("_", 1)[1]
-    selected_queue = bump_jobqueue(job_num, job_state, state_file, queue_shift, ncpu)
-    if job_state is None and selected_queue is not None:
-        scale_submit_resources(f"{jobs_folder}/{job}.sub", ncpu)
-    return selected_queue
+    if job_state is not None:
+        candidate = _candidate_dynamic_state(job_state, job_num, queue_shift, ncpu)
+        job_state[job_num] = candidate
+        save_job_state(state_file, job_state)
+        materialize_job_submit_state(jobs_folder, job_num, job_state)
+        return candidate["queue"]
+    text, queue = _candidate_legacy_text(Path(jobs_folder, f"job_{job}.sub").read_text(), queue_shift, ncpu)
+    Path(jobs_folder, f"job_{job}.sub").write_text(text)
+    return queue
 
 
 def bump_jobqueue(job_num, job_state=None, state_file=None, shift=1, ncpu=1):
@@ -876,26 +1064,53 @@ def is_xrootd_exhaustion_log(out_text):
     return any(marker in out_text for marker in markers)
 
 
-def submit_resubmit_jobs(jobs_folder, job_nums, job_state, state_file, log_text):
+def submit_resubmit_jobs(jobs_folder, job_nums, job_state, state_file, log_text,
+                         pending_candidates=None):
     job_nums = list(dict.fromkeys(str(job_num) for job_num in job_nums))
+    pending_candidates = pending_candidates or {}
+    succeeded_jobs = []
     if job_state is None or not (Path(jobs_folder) / "resubmit.sub").exists():
-        succeeded = True
         for job_num in job_nums:
-            submitted, output = condor_submit_job(jobs_folder, f"job_{job_num}.sub")
-            log_text.append(output)
-            if not submitted:
-                mark_job_failed(jobs_folder, f"job_{job_num}")
-                succeeded = False
+            candidate = pending_candidates.get(f"job_{job_num}", {})
+            sub_path = Path(jobs_folder) / f"job_{job_num}.sub"
+            temporary = None
+            try:
+                prepare_proxy_for_jobs(jobs_folder)
+                candidate_text = candidate.get("sub")
+                if candidate_text is None and candidate.get("state") is not None:
+                    candidate_text = _materialize_submit_text(
+                        sub_path.read_text(), candidate["state"]
+                    )
+                if candidate_text is not None:
+                    temporary = sub_path.with_name(f".resubmit_{job_num}.{os.getpid()}.sub")
+                    temporary.write_text(candidate_text)
+                    submit_name = temporary.name
+                else:
+                    submit_name = sub_path.name
+            except Exception as exc:
+                log_text.append(f"[red]Could not prepare proxy for job_{job_num}: {exc}[/]")
                 continue
-            mark_job_idle(jobs_folder, f"job_{job_num}")
-        return succeeded
+            submitted, output = condor_submit_job(jobs_folder, submit_name)
+            log_text.append(output)
+            if submitted:
+                if temporary is not None:
+                    os.replace(temporary, sub_path)
+                if job_state is not None and candidate.get("state") is not None:
+                    job_state[job_num] = candidate["state"]
+                    save_job_state(state_file, job_state)
+                    materialize_job_submit_state(jobs_folder, job_num, job_state)
+                mark_job_idle(jobs_folder, f"job_{job_num}")
+                _record_attempt(jobs_folder, job_num, job_state, state_file)
+                succeeded_jobs.append(job_num)
+            else:
+                log_text.append(f"[red]Failed to resubmit job_{job_num}; persistent state unchanged.[/]")
+            if temporary is not None and temporary.exists():
+                temporary.unlink()
+        return succeeded_jobs
 
     job_nums = [job_num for job_num in job_nums if job_num in job_state]
     if not job_nums:
         return False
-
-    for job_num in job_nums:
-        materialize_job_submit_state(jobs_folder, job_num, job_state)
 
     with open(f"{jobs_folder}/resubmit.sub") as f:
         template = f.read()
@@ -903,26 +1118,34 @@ def submit_resubmit_jobs(jobs_folder, job_nums, job_state, state_file, log_text)
         f.write(template)
         f.write("\nqueue PROC, QUEUE, CHUNKSIZE, CPUS, MEMORY from (\n")
         for job_num in job_nums:
-            state = job_state[job_num]
+            state = pending_candidates.get(f"job_{job_num}", {}).get("state", job_state[job_num])
             f.write(
                 f"  {job_num} {state['queue']} {state['chunksize']} "
                 f"{state['request_cpus']} {state['request_memory']}\n"
             )
         f.write(")\n")
 
+    try:
+        prepare_proxy_for_jobs(jobs_folder)
+    except Exception as exc:
+        log_text.append(f"[red]Could not prepare proxy for resubmission: {exc}[/]")
+        return succeeded_jobs
     resubmit_succeeded, resubmit_log = condor_submit_job(jobs_folder, "resubmit_now.sub")
     log_text.append(resubmit_log)
     if resubmit_succeeded:
         for job_num in job_nums:
+            candidate = pending_candidates.get(f"job_{job_num}", {}).get("state")
+            if candidate is not None:
+                job_state[job_num] = candidate
             mark_job_idle(jobs_folder, f"job_{job_num}")
-            job_state[job_num]["resubmissions"] += 1
+            job_state[job_num]["resubmissions"] = int(job_state[job_num].get("resubmissions", 0)) + 1
+            materialize_job_submit_state(jobs_folder, job_num, job_state)
+            succeeded_jobs.append(job_num)
         save_job_state(state_file, job_state)
         log_text.append(f"[red]Resubmitted {len(job_nums)} failed jobs to condor[/]")
     else:
         log_text.append(f"[red]Failed to resubmit {len(job_nums)} failed jobs to condor[/]")
-        for job_num in job_nums:
-            mark_job_failed(jobs_folder, f"job_{job_num}")
-    return resubmit_succeeded
+    return succeeded_jobs
 
 
 def latest_job_out(jobs_folder, job_name):
@@ -935,8 +1158,9 @@ def latest_job_out(jobs_folder, job_name):
 
 def convert_timeout_jobs(jobs_folder, timeout_jobs, running_jobs, idle_jobs, failed_jobs,
                          queue_shift, ncpu, job_state, state_file, log_text,
-                         shifted_jobs=None):
+                         shifted_jobs=None, pending_candidates=None):
     shifted_jobs = shifted_jobs if shifted_jobs is not None else set()
+    pending_candidates = pending_candidates if pending_candidates is not None else {}
     converted = 0
     for job in list(timeout_jobs):
         if job in running_jobs:
@@ -949,7 +1173,14 @@ def convert_timeout_jobs(jobs_folder, timeout_jobs, running_jobs, idle_jobs, fai
         (Path(jobs_folder) / f"{job}.failed").touch()
 
         job_num = job.split("_", 1)[1]
-        next_jf = bump_jobqueue(job_num, job_state, state_file, queue_shift, ncpu)
+        if job_state is not None and job_num in job_state:
+            candidate_state = _candidate_dynamic_state(job_state, job_num, queue_shift, ncpu)
+            pending_candidates[job] = {"state": candidate_state}
+            next_jf = candidate_state["queue"]
+        else:
+            current = (Path(jobs_folder) / f"{job}.sub").read_text()
+            candidate_sub, next_jf = _candidate_legacy_text(current, queue_shift, ncpu)
+            pending_candidates[job] = {"sub": candidate_sub}
         shifted_jobs.add(job)
         log_text.append(f"{job} reached the Condor time limit. Marked as failed and bumped to longer condor queue: {next_jf}.")
         converted += 1
@@ -960,7 +1191,7 @@ def convert_timeout_jobs(jobs_folder, timeout_jobs, running_jobs, idle_jobs, fai
 @click.option("-d","--details", is_flag=True, help="Show the details of the jobs")
 @click.option("-r","--resubmit", is_flag=True, help="Resubmit the failed jobs")
 @click.option("-m","--max-resubmit", type=int, help="Maximum number of resubmission", default=4)
-@click.option("-q","--queue-shift", type=int, help="How many queues to bump to if a job is removed due to time limit? E.g. 1 = bump to next queue, 2 = bump to next-to-next queue", default=1)
+@click.option("-q","--queue-shift", type=click.IntRange(min=0), help="How many queues to bump to if a job is removed due to time limit? E.g. 1 = bump to next queue, 2 = bump to next-to-next queue", default=1)
 @click.option("-n", "--ncpu", type=click.IntRange(min=1), default=1, show_default=True,
               help="CPU and memory multiplier applied once when a job's queue is shifted")
 @click.option("--by", "group_by", type=click.Choice(["sample", "dataset", "none"]),
@@ -1015,7 +1246,7 @@ def check_jobs(jobs_folder, details, resubmit, max_resubmit,
             + ", ".join(sorted(invalid_blocklist))
         )
     if recreate is not None:
-        recreate_jobs_oneshot(
+        recreate_result = recreate_jobs_oneshot(
             jobs_folder,
             recreate,
             use_redirector=use_redirector,
@@ -1026,6 +1257,8 @@ def check_jobs(jobs_folder, details, resubmit, max_resubmit,
             ncpu=ncpu,
             remove_running=remove_running,
         )
+        if recreate_result and recreate_result.get("failed"):
+            raise click.exceptions.Exit(1)
         if not resubmit:
             return
 
@@ -1077,12 +1310,14 @@ def check_jobs(jobs_folder, details, resubmit, max_resubmit,
     findings = scan_condor_log_failures(jobs_folder, condor_log_offsets)
     idle_jobs, running_jobs, done_jobs, failed_jobs, timeout_jobs = check_jobs_logs(jobs_folder)
     initially_shifted_jobs = set()
+    pending_candidates = {}
     if mutation_enabled:
         apply_condor_log_failures(jobs_folder, findings)
         idle_jobs, running_jobs, done_jobs, failed_jobs, timeout_jobs = check_jobs_logs(jobs_folder)
         convert_timeout_jobs(
             jobs_folder, timeout_jobs, running_jobs, idle_jobs, failed_jobs,
             queue_shift, ncpu, job_state, state_file, log_text, initially_shifted_jobs,
+            pending_candidates=pending_candidates,
         )
     else:
         idle_jobs, running_jobs, done_jobs, failed_jobs, timeout_jobs = merge_inferred_status(
@@ -1115,6 +1350,7 @@ def check_jobs(jobs_folder, details, resubmit, max_resubmit,
                     convert_timeout_jobs(
                         jobs_folder, timeout_jobs, running_jobs, idle_jobs, failed_jobs,
                         queue_shift, ncpu, job_state, state_file, log_text, shifted_jobs,
+                        pending_candidates=pending_candidates,
                     )
                 else:
                     idle_jobs, running_jobs, done_jobs, failed_jobs, timeout_jobs = merge_inferred_status(
@@ -1132,7 +1368,6 @@ def check_jobs(jobs_folder, details, resubmit, max_resubmit,
                     layout["left"].update(Panel(tables[0], title="Job Status"))
 
                 resubmit_now = []
-                ordinary_bumps = []
                 # Checking failed jobs
                 if len(failed_jobs) > 0:
                     if len(failed_jobs) > len(definitive_failed) and not resubmit:
@@ -1160,52 +1395,57 @@ def check_jobs(jobs_folder, details, resubmit, max_resubmit,
                             else:
                                 log_text.append( f"Error in job {failed_job}: No .out file found")
 
-                            if resubmit and failed_jobs_stats[failed_job] <= max_resubmit:
-                                failed_job_num = failed_job.split("_", 1)[1]
+                            failed_job_num = failed_job.split("_", 1)[1]
+                            attempts = _attempts(jobs_folder, failed_job_num, job_state)
+                            if resubmit and attempts < max_resubmit:
                                 xrootd_exhausted = is_xrootd_exhaustion_log(out_text)
                                 if xrootd_exhausted:
                                     log_text.append(
                                         f"{failed_job} exhausted XRootD recovery. "
                                         "Resubmitting the original AFS config without queue changes."
                                     )
-                                elif (
-                                    job_state is not None
-                                    and failed_job_num in job_state
-                                    and job_state[failed_job_num].get("resubmissions", 0) >= 1
-                                    and failed_job not in timeout_jobs
-                                    and failed_job not in shifted_jobs
-                                ):
-                                    ordinary_bumps.append(failed_job_num)
+                                elif attempts >= 1 and failed_job not in timeout_jobs and failed_job not in shifted_jobs:
+                                    if failed_job not in pending_candidates:
+                                        if job_state is not None and failed_job_num in job_state:
+                                            pending_candidates[failed_job] = {
+                                                "state": _candidate_dynamic_state(
+                                                    job_state, failed_job_num, queue_shift, ncpu
+                                                )
+                                            }
+                                            log_text.append(
+                                                f"{failed_job} failed again; preparing an escalation to "
+                                                f"{pending_candidates[failed_job]['state']['queue']}."
+                                            )
+                                        else:
+                                            current_sub = (jobs_folder / f"job_{failed_job_num}.sub").read_text()
+                                            pending_candidates[failed_job] = {
+                                                "sub": _candidate_legacy_text(current_sub, queue_shift, ncpu)[0]
+                                            }
                                 resubmit_now.append(failed_job_num)
                             else:
                                 # Add it to the list of jobs that are definitely failed
                                 definitive_failed.append(failed_job)
 
-                for job_num in ordinary_bumps:
-                    escalated_queue = bump_jobqueue(
-                        job_num, job_state, state_file, queue_shift, ncpu
-                    )
-                    log_text.append(
-                        f"job_{job_num} failed again; escalating to {escalated_queue}."
-                    )
-
                 if resubmit_now:
-                    if submit_resubmit_jobs(
-                        jobs_folder, resubmit_now, job_state, state_file, log_text
-                    ):
-                        for job_num in set(resubmit_now):
+                    successful = submit_resubmit_jobs(
+                        jobs_folder, resubmit_now, job_state, state_file, log_text,
+                        pending_candidates=pending_candidates,
+                    )
+                    for job_num in set(successful):
                             job = f"job_{job_num}"
                             if job in failed_jobs:
                                 failed_jobs.remove(job)
                             if job not in idle_jobs:
                                 idle_jobs.append(job)
+                            pending_candidates.pop(job, None)
                    
                 if len(log_text):
                     if len(log_text) > 20:
                         log_text = log_text[-20:]
                     layout["right"].update(Panel("\n".join(log_text), title="Log"))
 
-                if len(tot_jobs) == len(done_jobs) + len(failed_jobs):
+                terminal_failed = len(definitive_failed) if resubmit else len(failed_jobs)
+                if len(tot_jobs) == len(done_jobs) + terminal_failed:
                     rprint("[green]All jobs are completed[/]")
                     rprint(f"Now merge outputs with [yellow]merge-outputs -jc {jobs_folder}[/].")
                     break

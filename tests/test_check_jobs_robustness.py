@@ -31,6 +31,7 @@ def _ensure_rucio_importable():
 _ensure_rucio_importable()
 
 from pocket_coffea.scripts.check_jobs import QUEUES, bump_jobqueue, set_queue  # noqa: E402
+from pocket_coffea.utils.htcondor_queue import next_queue  # noqa: E402
 
 
 def _write_sub(tmp_path, content):
@@ -77,3 +78,11 @@ def test_set_queue_noop_when_already_set(tmp_path):
 def test_set_queue_without_jobflavour_returns_false(tmp_path):
     sub = _write_sub(tmp_path, "executable = job.sh\n+MaxRuntime = 3600\nqueue\n")
     assert set_queue(sub, "longlunch") is False
+
+
+def test_negative_queue_shift_is_a_noop():
+    assert next_queue("espresso", -1) == "espresso"
+
+
+def test_large_queue_shift_caps_at_nextweek():
+    assert next_queue("espresso", 100) == "nextweek"

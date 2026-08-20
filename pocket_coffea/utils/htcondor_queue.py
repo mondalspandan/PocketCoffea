@@ -47,9 +47,10 @@ def queue_for_runtime(seconds, threshold_percent):
 
 def next_queue(current, shift=1):
     """Advance a queue name, using the longest known queue for unknown names."""
+    shift = max(0, int(shift))
     if current not in QUEUES:
         return QUEUES[-1]
-    return QUEUES[min(QUEUES.index(current) + int(shift), len(QUEUES) - 1)]
+    return QUEUES[min(QUEUES.index(current) + shift, len(QUEUES) - 1)]
 
 
 def _read_flavour(line):

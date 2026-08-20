@@ -546,7 +546,7 @@ called `job`, the tool descends into it automatically.
 | `-j, --jobs-folder` | *(required)* | Folder containing the `job_*.sub` and `job_*.{idle,running,done,failed,timeout}` files. |
 | `-d, --details` | off | Show a per-job status table in addition to the summary. |
 | `-r, --resubmit` | off | Actively resubmit failed jobs with the recovery logic described below. |
-| `-m, --max-resubmit` | `4` | Give up on a job after this many resubmissions. |
+| `-m, --max-resubmit` | `4` | Give up on a job after this many successful replacement submissions; the count persists across monitor restarts. |
 | `-q, --queue-shift` | `1` | When HTCondor aborts a job with `SYSTEM_PERIODIC_REMOVE` (max time exceeded), bump its `+JobFlavour` by this many steps along `espresso → microcentury → longlunch → workday → tomorrow → testmatch → nextweek` before resubmitting. |
 | `--by sample\|dataset\|none` | `sample` | Show a per-group progress table below the summary, with a stacked coloured bar (green=done, magenta=running, blue=idle, red=failed) and a `% Done` column sorted from slowest to fastest sample. Requires `jobs_config.yaml` in the jobs folder (written by the manual-job executors); pass `none` to disable. If the YAML is missing the tool silently falls back to the legacy single-table layout. |
 | `--recreate SELECTOR` | — | One-shot proactive recreate/resubmit of a chosen set of jobs, then exit (unless `--resubmit` is also given). `SELECTOR` is `auto` (all `.failed`/`.running`/`.idle`/`.timeout` jobs) or a comma list (`0,1,3` or `job_0,job_3`). Active jobs require `--remove-running`. See [One-shot / proactive recreate](#one-shot-proactive-recreate). |
@@ -610,8 +610,8 @@ queue bumping is a no-op there.
 For every job whose flag file is `.failed`, `check-jobs` inspects its latest `.out` log.
 The wrapper already retries XRootD failures against alternate sites before exposing a
 failure. A timeout creates a `.timeout` marker; the monitor converts it to `.failed`,
-bumps the job's `+JobFlavour`, and scales its CPU/memory request once. Ordinary repeat
-For ordinary non-XRootD failures, the first resubmission keeps the current queue and
+bumps the job's `+JobFlavour`, and scales its CPU/memory request once. For ordinary
+non-XRootD failures, the first resubmission keeps the current queue and
 resources; a later failure after a successful resubmission advances the queue and
 applies the one-time CPU/memory scaling. XRootD recovery exhaustion remains an
 unchanged-config retry and does not trigger that escalation. Timeouts follow their
@@ -620,10 +620,11 @@ separate queue/resource escalation path.
 For newly created lxplus directories, the monitor writes one `resubmit_now.sub` from
 `resubmit.sub` and `job_state.json`, containing every failed job in that polling pass,
 then submits that single batch. The marker files are changed to `.idle` only after the
-batch submission succeeds. Existing directories without dynamic state remain supported:
-they use their individual `job_{i}.sub` files.
+batch submission succeeds, and successful replacement counts persist in `job_state.json`.
+Existing directories without dynamic state remain supported: they use their individual
+`job_{i}.sub` files and persist counts in `check_jobs_state.json`.
 
-The tool exits automatically when `done + failed == total`, and prints the suggested
+The tool exits automatically when `done + definitively failed == total`, and prints the suggested
 next command:
 
 ```
@@ -641,7 +642,7 @@ the dynamic state for new directories. Avoid running two `check-jobs --resubmit`
 `--recreate` processes against the same directory at once — they would issue duplicate
 `condor_submit` calls.
 
-For new manual-job directories, `job_state.json` is authoritative for each job's
+For new LXPLUS manual-job directories, `job_state.json` is authoritative for each job's
 queue, chunksize, CPU count, and memory. Before proactive recreation, the concrete
 `job_i.sub` is materialised from that state, so reactive resource escalation is not
 lost. The submission metadata in `jobs_config.yaml` records whether a grid

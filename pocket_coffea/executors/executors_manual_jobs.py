@@ -78,14 +78,17 @@ def ensure_job_sh_forwards_inner_yaml(job_sh_path,
         content = f.read()
     if yaml_filename in content:
         return False
-    # The wrapper line we need to patch looks like:
-    #   "<runner> --cfg $2 -o output --executor iterative --chunksize $3"
-    # We append `--custom-run-options <yaml>` to it.
-    new_content = content.replace(
-        "--chunksize $3",
-        f"--chunksize $3 --custom-run-options {yaml_filename}",
-        1,
-    )
+    lines = content.splitlines(keepends=True)
+    new_lines = []
+    patched = False
+    for line in lines:
+        if not patched and ("pocket-coffea run" in line or "runner run" in line):
+            newline = "" if not line.endswith(("\n", "\r")) else line[-1]
+            body = line.rstrip("\r\n")
+            line = f"{body} --custom-run-options {yaml_filename}{newline}"
+            patched = True
+        new_lines.append(line)
+    new_content = "".join(new_lines)
     if new_content == content:
         return False
     with open(job_sh_path, "w") as f:

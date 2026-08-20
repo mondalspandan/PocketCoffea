@@ -27,7 +27,6 @@ class DaskExecutorFactory(ExecutorFactoryABC):
         pathvar = [i for i in os.environ["PATH"].split(":") if "envs/PocketCoffea/" in i][0]
         env_worker = [
             'export XRD_RUNFORKHANDLER=1',
-            f'export X509_USER_PROXY={self.x509_path}',
             f'export X509_CERT_DIR={pathvar[:-4]}/etc/grid-security/certificates',   #Note: this needs `conda install conda-forge::ca-certificates`
             'ulimit -s unlimited',
             # f'source {os.environ["HOME"]}/.bashrc',
@@ -38,6 +37,8 @@ class DaskExecutorFactory(ExecutorFactoryABC):
             'voms-proxy-info',
             'echo Path $PATH'
             ]
+        if not self.run_options.get("ignore-grid-certificate", False):
+            env_worker.insert(1, f'export X509_USER_PROXY={self.x509_path}')
         
         # Adding list of custom setup commands from user defined run options
         if self.run_options.get("custom-setup-commands", None):
@@ -147,9 +148,10 @@ class ExecutorFactoryCondorUMD(ExecutorFactoryManualABC):
         inner_yaml_path = write_inner_run_options(self.jobs_dir, self.run_options)
         inner_yaml_basename = os.path.basename(inner_yaml_path)
 
+        proxy_env = (f"export X509_USER_PROXY={self.x509_path.split('/')[-1]}\n"
+                     if not self.run_options.get("ignore-grid-certificate", False) else "")
         script = f"""#!/bin/bash
-export X509_USER_PROXY={self.x509_path.split("/")[-1]}
-export XRD_RUNFORKHANDLER=1
+{proxy_env}export XRD_RUNFORKHANDLER=1
 export MALLOC_TRIM_THRESHOLD_=0
 JOBDIR={abs_jobdir_path}
 
@@ -173,7 +175,7 @@ fi
 echo 'Done'"""
         
         if int(self.run_options["cores-per-worker"]) > 1:
-            script = script.replace("EXECUTOR", f"--executor futures --scalout {self.run_options['cores-per-worker']}")
+            script = script.replace("EXECUTOR", f"--executor futures --scaleout {self.run_options['cores-per-worker']}")
         else:
             script = script.replace("EXECUTOR", "--executor iterative")
             
@@ -181,6 +183,11 @@ echo 'Done'"""
             f.write(script)
 
         # Writing the jid file as the htcondor python submission does not work in the singularity
+        transfer_input_files = [f"{abs_jobdir_path}/config_job_$(ProcId).pkl",
+                                f"{abs_jobdir_path}/job.sh",
+                                f"{abs_jobdir_path}/{inner_yaml_basename}"]
+        if not self.run_options.get("ignore-grid-certificate", False):
+            transfer_input_files.insert(1, self.x509_path)
         sub = {
             'Executable': "job.sh",
             'Error': f"{abs_jobdir_path}/logs/job_$(ClusterId).$(ProcId).err",
@@ -194,7 +201,7 @@ echo 'Done'"""
             'arguments': f"$(ProcId) config_job_$(ProcId).pkl {abs_output_path} $(chunksize)",
             'should_transfer_files':'YES',
             'when_to_transfer_output' : 'ON_EXIT',
-            'transfer_input_files' : f"{abs_jobdir_path}/config_job_$(ProcId).pkl,{self.x509_path},{abs_jobdir_path}/job.sh,{abs_jobdir_path}/{inner_yaml_basename}",
+            'transfer_input_files' : ",".join(transfer_input_files),
             'on_exit_remove': '(ExitBySignal == False) && (ExitCode == 0)',
             'max_retries' : self.run_options["max-retries"],
             'requirements' : 'Machine =!= LastRemoteHost',

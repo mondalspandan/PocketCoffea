@@ -190,9 +190,9 @@ def test_recreate_timeout_scales_resources_and_queue(tmp_path, replicas):
     (d / "job_state.json").write_text(json.dumps(state))
     check_jobs.recreate_jobs_oneshot(d, "0", use_redirector=True, ncpu=3, dry_run=True)
     persisted = json.loads((d / "job_state.json").read_text())
-    assert persisted["0"]["queue"] == "microcentury"
-    assert persisted["0"]["request_cpus"] == 6
-    assert persisted["0"]["request_memory"] == "12GB"
+    assert persisted["0"]["queue"] == "espresso"
+    assert persisted["0"]["request_cpus"] == 2
+    assert persisted["0"]["request_memory"] == "4GB"
     sub = (d / "job_0.sub").read_text()
     assert "RequestCpus = 6" in sub
     assert "arguments = 0 config_job_0.pkl 100 6" in sub
@@ -372,6 +372,40 @@ def test_failed_condor_rm_keeps_active_job_and_skips_submit(tmp_path, replicas, 
     assert not (d / "job_0.idle").exists()
 
 
+def test_active_recreate_proxy_failure_does_not_remove_job(tmp_path, replicas, monkeypatch):
+    f = SITEA + "/store/data/foo.root"
+    d = _make_jobs_dir(tmp_path, {"job_0": {"filesets": _fs([f]), "flag": "running"}})
+    removed = []
+    monkeypatch.setattr(check_jobs, "prepare_proxy_for_jobs",
+                        lambda folder: (_ for _ in ()).throw(RuntimeError("proxy expired")))
+    monkeypatch.setattr(check_jobs, "condor_rm_job", lambda job: removed.append(job))
+
+    result = check_jobs.recreate_jobs_oneshot(
+        d, "0", use_redirector=True, remove_running=True, dry_run=False
+    )
+
+    assert removed == []
+    assert "job_0" in result["failed"]
+    assert (d / "job_0.running").exists()
+
+
+def test_active_recreate_rewrite_failure_does_not_remove_job(tmp_path, replicas, monkeypatch):
+    f = SITEA + "/store/data/foo.root"
+    d = _make_jobs_dir(tmp_path, {"job_0": {"filesets": _fs([f]), "flag": "running"}})
+    removed = []
+    monkeypatch.setattr(check_jobs, "rewrite_fileset_to_redirector",
+                        lambda fileset: (_ for _ in ()).throw(RuntimeError("rewrite failed")))
+    monkeypatch.setattr(check_jobs, "condor_rm_job", lambda job: removed.append(job))
+
+    result = check_jobs.recreate_jobs_oneshot(
+        d, "0", use_redirector=True, remove_running=True, dry_run=False
+    )
+
+    assert removed == []
+    assert "rewrite failed" in result["failed"]["job_0"]
+    assert (d / "job_0.running").exists()
+
+
 def test_recreate_clears_all_markers_and_creates_one_idle(tmp_path, replicas, monkeypatch):
     f = SITEA + "/store/data/foo.root"
     d = _make_jobs_dir(tmp_path, {"job_0": {"filesets": _fs([f]), "flag": "failed"}})
@@ -462,9 +496,9 @@ def test_multi_job_recreation_keeps_one_shared_job_state(tmp_path, replicas):
         ncpu=3, dry_run=True,
     )
     persisted = json.loads((d / "job_state.json").read_text())
-    assert persisted["0"]["queue"] == persisted["1"]["queue"] == "workday"
-    assert persisted["1"]["request_cpus"] == 6
-    assert persisted["1"]["request_memory"] == "12GB"
+    assert persisted["0"]["queue"] == persisted["1"]["queue"] == "espresso"
+    assert persisted["1"]["request_cpus"] == 2
+    assert persisted["1"]["request_memory"] == "4GB"
     for job in ("job_0", "job_1"):
         sub = (d / f"{job}.sub").read_text()
         assert '+JobFlavour="workday"' in sub
@@ -548,4 +582,24 @@ def test_missing_required_proxy_fails_before_submission(tmp_path, monkeypatch):
         proxy_source="explicit",
     )
     with pytest.raises(RuntimeError, match="does not exist"):
+        check_jobs.prepare_proxy_for_jobs(tmp_path)
+
+
+def test_default_proxy_refresh_is_private(tmp_path, monkeypatch):
+    source = tmp_path / "current.proxy"
+    target = tmp_path / "transfer.proxy"
+    source.write_bytes(b"fresh")
+    _write_submission_contract(tmp_path, requires_grid_certificate=True,
+                               proxy_transfer_path=str(target), proxy_source="default")
+    monkeypatch.setattr(check_jobs, "get_proxy_path", lambda: str(source))
+    check_jobs.prepare_proxy_for_jobs(tmp_path)
+    assert target.read_bytes() == b"fresh"
+    assert target.stat().st_mode & 0o777 == 0o600
+
+
+def test_ambiguous_legacy_proxy_inference_fails(tmp_path):
+    (tmp_path / "job_0.sub").write_text(
+        "transfer_input_files = config_job_0.pkl,custom_a,custom_b\n"
+    )
+    with pytest.raises(RuntimeError, match="unambiguously infer"):
         check_jobs.prepare_proxy_for_jobs(tmp_path)
