@@ -2,6 +2,7 @@
 import json
 import time
 
+import pytest
 import yaml
 from click.testing import CliRunner
 
@@ -16,13 +17,11 @@ def make_jobs(tmp_path, executor="condor@lxplus"):
         "requires_grid_certificate": False,
         "proxy_transfer_path": None,
         "proxy_source": None,
-        "supports_queue_escalation": executor == "condor@lxplus",
     }
     state = {"0": {"chunksize": 100, "request_cpus": 1,
                     "request_memory": "4GB", "resubmissions": 0}}
     if executor == "condor@lxplus":
-        state["0"].update({"queue": "espresso", "base_cpus": 1,
-                           "base_memory": "4GB", "resources_scaled": False})
+        state["0"].update({"queue": "espresso", "resources_scaled": False})
     (tmp_path / "jobs_config.yaml").write_text(yaml.safe_dump({
         "submission": submission, "jobs_list": {"job_0": {"filesets": {}}},
     }))
@@ -33,8 +32,8 @@ def make_jobs(tmp_path, executor="condor@lxplus"):
         "RequestCpus = $(CPUS)\nRequestMemory = $(MEMORY)\n"
         "arguments = $(PROC) $(CHUNKSIZE) $(CPUS)\n"
     )
+    (tmp_path / "jobs_all.sub").write_text("queue\n")
     (tmp_path / "config_job_0.pkl").write_bytes(b"placeholder")
-    (tmp_path / "job_0.sub").write_text("queue\n")
     (tmp_path / "job_0.running").touch()
 
 
@@ -57,6 +56,7 @@ def test_recreate_requires_current_contract(tmp_path):
 def test_current_contract_is_accepted(tmp_path):
     make_jobs(tmp_path)
     assert check_jobs.load_current_contract(tmp_path)[2]["executor"] == "condor@lxplus"
+    assert not (tmp_path / "job_0.sub").exists()
 
 
 def test_passive_check_jobs_does_not_mutate_markers_or_state(tmp_path, monkeypatch):
@@ -68,7 +68,7 @@ def test_passive_check_jobs_does_not_mutate_markers_or_state(tmp_path, monkeypat
     )
     snapshots = {
         path: (path.read_bytes(), path.stat().st_mtime_ns)
-        for path in (tmp_path / "job_state.json", tmp_path / "job_0.sub")
+        for path in (tmp_path / "job_state.json", tmp_path / "resubmit.sub")
     }
     monkeypatch.setattr(check_jobs, "condor_submit_job",
                         lambda *args: (_ for _ in ()).throw(AssertionError()))
@@ -140,21 +140,21 @@ def test_failed_recreate_restores_canonical_config(tmp_path, monkeypatch):
         assert cloudpickle.load(handle).filesets == {"original": {"files": ["old.root"]}}
 
 
-def test_reactive_submit_commits_retry_before_local_materialization(tmp_path, monkeypatch):
+def test_reactive_marker_failure_stops_after_committing_retry(tmp_path, monkeypatch):
     make_jobs(tmp_path)
     state = json.loads((tmp_path / "job_state.json").read_text())
     log_text = []
     monkeypatch.setattr(check_jobs, "prepare_proxy_for_jobs", lambda folder: None)
     monkeypatch.setattr(check_jobs, "condor_submit_job", lambda *args: (True, ""))
-    monkeypatch.setattr(check_jobs, "materialize_job_submit_state",
+    monkeypatch.setattr(check_jobs, "mark_job_idle",
                         lambda *args: (_ for _ in ()).throw(OSError("local write")))
-    successful = check_jobs.submit_resubmit_jobs(
-        tmp_path, ["0"], state, tmp_path / "job_state.json", log_text)
-    assert successful == ["0"]
+    with pytest.raises(RuntimeError, match="accepted the replacement"):
+        check_jobs.submit_resubmit_jobs(
+            tmp_path, ["0"], state, tmp_path / "job_state.json", log_text)
     assert json.loads((tmp_path / "job_state.json").read_text())["0"]["resubmissions"] == 1
 
 
-def test_successful_recreate_is_not_reported_failed_after_marker_error(tmp_path, monkeypatch):
+def test_successful_recreate_marker_failure_stops_after_submission(tmp_path, monkeypatch):
     make_jobs(tmp_path)
     (tmp_path / "job_0.running").unlink()
     import cloudpickle
@@ -163,6 +163,6 @@ def test_successful_recreate_is_not_reported_failed_after_marker_error(tmp_path,
     monkeypatch.setattr(check_jobs, "condor_submit_job", lambda *args: (True, ""))
     monkeypatch.setattr(check_jobs, "mark_job_idle",
                         lambda *args: (_ for _ in ()).throw(OSError("marker write")))
-    result = check_jobs.recreate_jobs_oneshot(tmp_path, "0")
-    assert result["submitted"] == ["job_0"]
-    assert "job_0" not in result["failed"]
+    with pytest.raises(RuntimeError, match="accepted the replacement"):
+        check_jobs.recreate_jobs_oneshot(tmp_path, "0")
+    assert json.loads((tmp_path / "job_state.json").read_text())["0"]["resubmissions"] == 1

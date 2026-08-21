@@ -3,7 +3,7 @@ import pytest
 
 from pocket_coffea.executors.executors_lxplus import ExecutorFactoryCondorCERN
 from pocket_coffea.executors.executors_manual_jobs import ExecutorFactoryManualABC
-from pocket_coffea.utils.htcondor_queue import queue_for_runtime
+from pocket_coffea.utils.htcondor_queue import next_queue, queue_for_runtime
 
 
 def _filesets():
@@ -178,6 +178,12 @@ def test_auto_mixed_dataset_runtime_is_summed(tmp_path):
     }
     jobs = [{"fast": filesets["fast"], "slow": filesets["slow"]}]
     assert factory._job_runtime_seconds(filesets, jobs, {"fast": 1.0, "slow": 2.0}) == [1500.0]
+
+
+def test_queue_shift_zero_is_a_noop_and_unknown_queues_bump_to_terminal():
+    assert next_queue("espresso", 0) == "espresso"
+    assert next_queue("site-specific", 0) == "site-specific"
+    assert next_queue("site-specific", 1) == "nextweek"
 
 
 def test_runtime_forecast_scales_per_worker_throughput(tmp_path):

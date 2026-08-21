@@ -338,8 +338,8 @@ When `--executor condor@lxplus` (or `condor@rubin`) is used, PocketCoffea:
    carries the *original* `Configurator` with the fileset filtered down to that job's
    slice. A summary `jobs_dir/jobs_config.yaml` records every job's fileset, config
    path, and output path.
-3. **Writes one HTCondor submit file per job** (`job_{i}.sub`) plus a batch
-   `jobs_all.sub`, a wrapper `job.sh`, and an empty `job_{i}.idle` flag file. The
+3. **Writes a batch HTCondor submit file** (`jobs_all.sub`), a recovery template
+   (`resubmit.sub`), a wrapper `job.sh`, and an empty `job_{i}.idle` flag file. The
    wrapper script copies the per-job output back to `--outputdir` once the job
    succeeds (using `xrdcp` if the output is on EOS).
 4. **Submits with `condor_submit jobs_all.sub`** unless `dry-run: true` is set.
@@ -448,11 +448,10 @@ A few caveats worth knowing about:
   into HTCondor with the inline `queue chunksize from ( ... )` form — one
   chunksize per line, embedded directly in `jobs_all.sub` — so a single
   `condor_submit jobs_all.sub` call submits everything regardless of whether
-  the resolved values are uniform or vary across jobs. The per-job `.sub`
-  files are still written and individually carry the right chunksize. Every
-  current-format manual directory also contains `jobs_config.yaml`,
-  `job_state.json`, `job.sh`, `inner_run_options.yaml`, `resubmit.sub`,
-  one `job_N.sub`, and one `config_job_N.pkl` per job. The state file is
+  the resolved values are uniform or vary across jobs. Every current-format
+  manual directory also contains `jobs_config.yaml`, `job_state.json`, `job.sh`,
+  `inner_run_options.yaml`, `jobs_all.sub`, `resubmit.sub`, and one
+  `config_job_N.pkl` per job. The state file is
   authoritative for recovery; Rubin uses it for retries but does not support
   lxplus queue/resource escalation.
 - **Unknown dict keys produce a warning** listing the samples actually
@@ -542,18 +541,19 @@ called `job`, the tool descends into it automatically.
 
 | Flag | Default | Purpose |
 |------|---------|---------|
-| `-j, --jobs-folder` | *(required)* | Folder containing the `job_*.sub` and `job_*.{idle,running,done,failed,timeout}` files. |
+| `-j, --jobs-folder` | *(required)* | Folder containing the current-format job files and `job_*.{idle,running,done,failed,timeout}` markers. |
 | `-d, --details` | off | Show a per-job status table in addition to the summary. |
 | `-r, --resubmit` | off | Actively resubmit failed jobs with the recovery logic described below. |
 | `-m, --max-resubmit` | `4` | Give up on a job after this many successful replacement submissions; the count persists across monitor restarts. |
 | `-q, --queue-shift` | `1` | When HTCondor aborts a job with `SYSTEM_PERIODIC_REMOVE` (max time exceeded), bump its `+JobFlavour` by this many steps along `espresso → microcentury → longlunch → workday → tomorrow → testmatch → nextweek` before resubmitting. |
+| `-n, --ncpu` | `1` | Multiply CPU and memory requests by this factor on first LXPLUS escalation. |
 | `--by sample\|dataset\|none` | `sample` | Show a per-group progress table below the summary. Current-format `jobs_config.yaml` is required; pass `none` to disable. |
 | `--recreate SELECTOR` | — | One-shot proactive recreate/resubmit of a chosen set of jobs, then exit (unless `--resubmit` is also given). `SELECTOR` is `auto` (all `.failed`/`.running`/`.idle`/`.timeout` jobs) or a comma list (`0,1,3` or `job_0,job_3`). Active jobs require `--remove-running`. See [One-shot / proactive recreate](#one-shot-proactive-recreate). |
 | `--once` | off | Run a single monitor/resubmit iteration then exit, instead of looping until all jobs finish. |
 | `--use-redirector` | off | With `--recreate`, rewrite every file through the global xrootd redirector (`root://xrootd-cms.infn.it//`) without Rucio lookups. Takes precedence over `--blocklist-sites`. |
 | `--blocklist-sites` | — | With `--recreate`, comma-separated CMS/Rucio site names (for example `T2_CH_CERN`) to avoid. XRootD prefixes are resolved from the site map and are not accepted here. Files at a blocklisted site are rewritten to an alternative replica via Rucio. |
 | `--recreate-queue` | — | With `--recreate`, force an lxplus job to this HTCondor queue. It is rejected for Rubin, which does not support queue/resource escalation. |
-| `--skip-bad-files` | off | With `--recreate`, atomically update only the current-format `inner_run_options.yaml`. |
+| `--skip-bad-files` | off | With `--recreate`, enable Coffea skip-bad-files in the shared `inner_run_options.yaml` for this jobs directory. |
 | `--remove-running` | off | With `--recreate`, `condor_rm` each recreated job's still-queued (running/idle) HTCondor instance before resubmitting, so a stuck job can't keep running and double-write its output. The instance is matched by the unique `config_job_<n>.pkl` in its lxplus `Args` ClassAd. |
 
 #### One-shot / proactive recreate
@@ -642,9 +642,9 @@ and commits the replacement only after scheduler acceptance. Avoid running two
 `check-jobs --resubmit` or `--recreate` processes against the same directory.
 
 For new LXPLUS manual-job directories, `job_state.json` is authoritative for each job's
-queue, chunksize, CPU count, and memory. Before proactive recreation, the concrete
-`job_i.sub` is materialised from that state, so reactive resource escalation is not
-lost. The submission metadata in `jobs_config.yaml` records whether a grid
+queue, chunksize, CPU count, and memory. Proactive and reactive recovery render
+temporary submit text from that state and `resubmit.sub`. The submission metadata in
+`jobs_config.yaml` records whether a grid
 certificate was required and which proxy transfer path was used. The sole retry
 counter is `job_state.json`'s `resubmissions` field: successful reactive or
 proactive replacements increment it, while failed scheduler submissions do not.

@@ -113,29 +113,24 @@ def load_current_contract(jobs_folder):
             raise ValueError
         if submission["executor"] not in ("condor@lxplus", "condor@rubin"):
             raise ValueError
-        for key in ("requires_grid_certificate", "proxy_transfer_path",
-                    "proxy_source", "supports_queue_escalation"):
+        for key in ("requires_grid_certificate", "proxy_transfer_path", "proxy_source"):
             if key not in submission:
                 raise ValueError
         state_file = folder / "job_state.json"
         state = json.loads(state_file.read_text())
         if not isinstance(state, dict) or not state:
             raise ValueError
-        for name in ("job.sh", "inner_run_options.yaml", "resubmit.sub"):
+        for name in ("job.sh", "inner_run_options.yaml", "jobs_all.sub", "resubmit.sub"):
             if not (folder / name).is_file():
                 raise ValueError
         for job, values in state.items():
-            if not (
-                (folder / f"config_job_{job}.pkl").is_file()
-                and (folder / f"job_{job}.sub").is_file()
-            ):
+            if not (folder / f"config_job_{job}.pkl").is_file():
                 raise ValueError
             if not all(key in values for key in
                        ("chunksize", "request_cpus", "request_memory", "resubmissions")):
                 raise ValueError
             if submission["executor"] == "condor@lxplus" and not all(
-                    key in values for key in
-                    ("queue", "base_cpus", "base_memory", "resources_scaled")):
+                    key in values for key in ("queue", "resources_scaled")):
                 raise ValueError
         return folder, metadata, submission, state, state_file
     except (FileNotFoundError, KeyError, ValueError, json.JSONDecodeError):
@@ -375,13 +370,6 @@ def mark_job_failed(jobs_folder, job):
     (Path(jobs_folder) / f"{job}.failed").touch()
 
 
-def save_job_state(state_file, state):
-    state_file = Path(state_file)
-    temp = state_file.with_name(f".{state_file.name}.{os.getpid()}.tmp")
-    temp.write_text(json.dumps(state, indent=2, sort_keys=True) + "\n")
-    os.replace(temp, state_file)
-
-
 def _write_state_temp(state_file, state):
     fd, name = tempfile.mkstemp(prefix=f".{Path(state_file).name}.", suffix=".tmp",
                                 dir=Path(state_file).parent)
@@ -436,14 +424,14 @@ def scale_memory(memory, factor):
     return f"{float(match.group(1)) * factor:g}{match.group(2)}"
 
 
-def candidate_state(current, submission, queue_shift, ncpu):
+def candidate_state(current, executor, queue_shift, ncpu):
     candidate = deepcopy(current)
-    if not submission["supports_queue_escalation"]:
+    if executor != "condor@lxplus":
         return candidate
     candidate["queue"] = next_queue(candidate["queue"], queue_shift)
     if not candidate["resources_scaled"]:
-        candidate["request_cpus"] = int(candidate["base_cpus"]) * ncpu
-        candidate["request_memory"] = scale_memory(candidate["base_memory"], ncpu)
+        candidate["request_cpus"] = int(candidate["request_cpus"]) * ncpu
+        candidate["request_memory"] = scale_memory(candidate["request_memory"], ncpu)
         candidate["resources_scaled"] = True
     return candidate
 
@@ -458,13 +446,6 @@ def render_states(folder, submission, states):
         rows.append(row)
     return render_condor_submit(
         (Path(folder) / "resubmit.sub").read_text(), rows, submission["executor"])
-
-
-def materialize_job_submit_state(jobs_folder, job_num, state):
-    folder, _, submission, _, _ = load_current_contract(jobs_folder)
-    (folder / f"job_{job_num}.sub").write_text(
-        render_states(folder, submission, {str(job_num): state[str(job_num)]}))
-    return True
 
 
 def is_xrootd_exhaustion_log(out_text):
@@ -491,10 +472,10 @@ def convert_timeout_jobs(jobs_folder, timeout_jobs, running, idle, failed,
         mark_job_failed(jobs_folder, job)
         failed.append(job) if job not in failed else None
         job_num = job.split("_", 1)[1]
-        pending[job] = candidate_state(state[job_num], submission, queue_shift, ncpu)
+        pending[job] = candidate_state(state[job_num], submission["executor"], queue_shift, ncpu)
         log_text.append(
             f"{job} reached the Condor time limit; preparing "
-            + ("queue/resource escalation." if submission["supports_queue_escalation"]
+            + ("queue/resource escalation." if submission["executor"] == "condor@lxplus"
                else "a retry."))
     return len(timeout_jobs)
 
@@ -530,11 +511,10 @@ def submit_resubmit_jobs(jobs_folder, job_nums, state, state_file, log_text, pen
         try:
             mark_job_idle(folder, f"job_{job}")
         except Exception as exc:
-            log_text.append(f"[yellow]Resubmitted job_{job}, but could not update its marker: {exc}[/]")
-        try:
-            materialize_job_submit_state(folder, job, state)
-        except Exception as exc:
-            log_text.append(f"[yellow]Resubmitted job_{job}, but could not materialize its submit file: {exc}[/]")
+            raise RuntimeError(
+                f"Condor accepted the replacement for job_{job}, but local marker "
+                f"bookkeeping failed; manual inspection is required: {exc}"
+            ) from exc
     log_text.append(f"[green]Resubmitted {len(states)} failed jobs to condor[/]")
     return list(states)
 
@@ -546,13 +526,6 @@ def recreate_jobs_oneshot(jobs_folder, jobs_to_recreate, *, use_redirector=False
     result = {"requested": [], "submitted": [], "skipped": [], "failed": {}}
     if recreate_queue is not None and submission["executor"] == "condor@rubin":
         raise click.UsageError("--recreate-queue is only supported for condor@lxplus")
-    if skip_bad_files:
-        options_path = folder / "inner_run_options.yaml"
-        options = yaml.safe_load(options_path.read_text()) or {}
-        options["skip-bad-files"] = True
-        temp = options_path.with_name(f".{options_path.name}.{os.getpid()}.tmp")
-        temp.write_text(yaml.safe_dump(options, sort_keys=False))
-        os.replace(temp, options_path)
 
     if jobs_to_recreate == "auto":
         jobs = []
@@ -568,6 +541,23 @@ def recreate_jobs_oneshot(jobs_folder, jobs_to_recreate, *, use_redirector=False
     if not jobs:
         return result
 
+    eligible_jobs = []
+    for job in jobs:
+        if job not in jobs_config["jobs_list"]:
+            result["failed"][job] = "job is not present in jobs_config.yaml"
+            continue
+        active = (folder / f"{job}.running").exists() or (folder / f"{job}.idle").exists()
+        if active and not remove_running:
+            if explicit:
+                result["failed"][job] = "job is active; pass --remove-running to recreate it"
+            else:
+                result["skipped"].append(job)
+            continue
+        eligible_jobs.append(job)
+    jobs = eligible_jobs
+    if not jobs:
+        return result
+
     blocklist = {normalize_rse(site) for site in (blocklist_sites or [])}
     failed_xrootd = []
     for job in jobs:
@@ -580,17 +570,18 @@ def recreate_jobs_oneshot(jobs_folder, jobs_to_recreate, *, use_redirector=False
         sitemap = get_xrootd_sites_map()
         client = get_rucio_client()
 
+    options_path = folder / "inner_run_options.yaml"
+    options_original = None
+    if skip_bad_files:
+        options_original = options_path.read_bytes()
+        options = yaml.safe_load(options_original) or {}
+        options["skip-bad-files"] = True
+        temp = options_path.with_name(f".{options_path.name}.{os.getpid()}.tmp")
+        temp.write_text(yaml.safe_dump(options, sort_keys=False))
+        os.replace(temp, options_path)
+
     for job in jobs:
-        if job not in jobs_config["jobs_list"]:
-            result["failed"][job] = "job is not present in jobs_config.yaml"
-            continue
         active = (folder / f"{job}.running").exists() or (folder / f"{job}.idle").exists()
-        if active and not remove_running:
-            if explicit:
-                result["failed"][job] = "job is active; pass --remove-running to recreate it"
-            else:
-                result["skipped"].append(job)
-            continue
         config_temp = sub_temp = None
         backup_path = None
         state_temp = None
@@ -618,7 +609,7 @@ def recreate_jobs_oneshot(jobs_folder, jobs_to_recreate, *, use_redirector=False
             job_num = job.split("_", 1)[1]
             candidate = deepcopy(state[job_num])
             if (folder / f"{job}.timeout").exists():
-                candidate = candidate_state(candidate, submission, queue_shift, ncpu)
+                candidate = candidate_state(candidate, submission["executor"], queue_shift, ncpu)
             if recreate_queue is not None:
                 candidate["queue"] = recreate_queue
             row = {"PROC": job_num, "CHUNKSIZE": candidate["chunksize"],
@@ -667,13 +658,12 @@ def recreate_jobs_oneshot(jobs_folder, jobs_to_recreate, *, use_redirector=False
             except Exception as exc:
                 rprint(f"[yellow]{job} was submitted, but could not remove the config backup: {exc}[/]")
             try:
-                os.replace(sub_temp, folder / f"{job}.sub")
-            except Exception as exc:
-                rprint(f"[yellow]{job} was submitted, but could not update its submit file: {exc}[/]")
-            try:
                 mark_job_idle(folder, job)
             except Exception as exc:
-                rprint(f"[yellow]{job} was submitted, but could not update its marker: {exc}[/]")
+                raise RuntimeError(
+                    f"Condor accepted the replacement for {job}, but local marker "
+                    f"bookkeeping failed; manual inspection is required: {exc}"
+                ) from exc
         except Exception as exc:
             if job not in result["submitted"] and backup_path and backup_path.exists():
                 config_path.unlink(missing_ok=True)
@@ -681,7 +671,7 @@ def recreate_jobs_oneshot(jobs_folder, jobs_to_recreate, *, use_redirector=False
             if state_temp and job not in result["submitted"]:
                 state_temp.unlink(missing_ok=True)
             if job in result["submitted"]:
-                rprint(f"[yellow]{job} was submitted, but local bookkeeping failed: {exc}[/]")
+                raise
             else:
                 result["failed"][job] = str(exc)
             if scheduler_instance_removed and job not in result["submitted"]:
@@ -691,6 +681,9 @@ def recreate_jobs_oneshot(jobs_folder, jobs_to_recreate, *, use_redirector=False
                 config_temp.unlink(missing_ok=True)
             if sub_temp:
                 sub_temp.unlink(missing_ok=True)
+
+    if options_original is not None and not result["submitted"]:
+        options_path.write_bytes(options_original)
 
     rprint("Recreate summary:")
     rprint(f"  submitted: {len(result['submitted'])}")
@@ -711,7 +704,7 @@ def recreate_jobs_oneshot(jobs_folder, jobs_to_recreate, *, use_redirector=False
               help="How many queues to bump to if a job is removed due to time limit? "
                    "E.g. 1 = bump to next queue, 2 = bump to next-to-next queue", default=1)
 @click.option("-n", "--ncpu", type=click.IntRange(min=1), default=1,
-              help="CPU count for recovery submissions")
+              help="Multiply CPU and memory requests by this factor on first LXPLUS escalation")
 @click.option("--by", "group_by", type=click.Choice(["sample", "dataset", "none"]),
               default="sample",
               help="Show a per-group progress table below the summary. Requires "
@@ -726,7 +719,7 @@ def recreate_jobs_oneshot(jobs_folder, jobs_to_recreate, *, use_redirector=False
 @click.option("--recreate-queue", type=str, default=None,
               help="Queue to use for recreated lxplus jobs")
 @click.option("--skip-bad-files", is_flag=True, default=False,
-              help="Skip the file recorded as bad during recreation")
+              help="Enable Coffea skip-bad-files in the shared inner worker options")
 @click.option("--remove-running", is_flag=True, default=False,
               help="Remove active Condor jobs before recreation")
 @_with_check_jobs_lock
@@ -811,7 +804,8 @@ def check_jobs(jobs_folder, details, resubmit, max_resubmit, queue_shift, ncpu, 
                         continue
                     if (attempts >= 1 and job not in timeout and job not in pending
                             and not is_xrootd_exhaustion_log(out_text)):
-                        pending[job] = candidate_state(state[number], submission, queue_shift, ncpu)
+                        pending[job] = candidate_state(
+                            state[number], submission["executor"], queue_shift, ncpu)
                     resubmit_now.append(number)
             if resubmit_now:
                 successful = submit_resubmit_jobs(folder, resubmit_now, state, state_file, log_text, pending)

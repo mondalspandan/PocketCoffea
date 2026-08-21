@@ -32,13 +32,6 @@ from pocket_coffea.utils.benchmarking import (
 )
 
 
-def _manual_job_migration_flags(executor, run_options):
-    if executor not in ("condor@lxplus", "condor@rubin"):
-        return []
-    return [k for k in ("recreate-jobs", "use-redirector", "recreate-queue", "blocklist-sites")
-            if k in run_options]
-
-
 def _executor_worker_count(executor, run_options):
     """Return the concurrency represented by the active local executor."""
     return 1 if executor == "iterative" else int(run_options.get("scaleout", 1))
@@ -193,19 +186,6 @@ def run(cfg,  custom_run_options, outputdir, test, limit_files, limit_samples,
         if not run_options.get("_timeit-worker", False):
             run_options["limit-files"] = None
             run_options["limit-chunks"] = 1 if executor in ("iterative", "futures") else None
-
-    # The manual-job recreate/resubmit path moved to `pocket-coffea check-jobs`.
-    # These flags used to be handled here. Fail loudly with a pointer instead of
-    # silently ignoring them.
-    _moved_flags = _manual_job_migration_flags(executor, run_options)
-    if _moved_flags:
-        rprint(f"[red]ERROR:[/] the manual-job recreate options {_moved_flags} have moved to "
-               f"[bold]pocket-coffea check-jobs[/].")
-        rprint("Use e.g. [yellow]pocket-coffea check-jobs -j <outputdir>/job --recreate auto "
-               "--use-redirector --blocklist-sites <sites> --recreate-queue <queue>[/] "
-               "(add [yellow]--resubmit[/] to babysit afterwards).")
-        exit(1)
-
 
     ## Default config for testing: iterative executor, with 2 file and 2 chunks
     if test:

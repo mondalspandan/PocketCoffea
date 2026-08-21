@@ -1,10 +1,10 @@
 import os, getpass
+import subprocess
 import sys
 import socket
 from coffea import processor as coffea_processor
 from .executors_base import ExecutorFactoryABC
-from .executors_manual_jobs import ExecutorFactoryManualABC, render_condor_submit
-from pathlib import Path
+from .executors_manual_jobs import ExecutorFactoryManualABC
 from .executors_base import IterativeExecutorFactory, FuturesExecutorFactory
 from pocket_coffea.utils.network import check_port
 
@@ -117,7 +117,6 @@ class ExecutorFactoryCondorUMD(ExecutorFactoryManualABC):
                     None if self.run_options["ignore-grid-certificate"]
                     else "explicit" if self.run_options.get("voms-proxy") else "default"
                 ),
-                "supports_queue_escalation": False,
             },
             "jobs_list": {}
         }
@@ -267,21 +266,11 @@ echo 'Done'"""
             import json
             json.dump(job_state, f, indent=2, sort_keys=True)
 
+        idle_markers = []
         for i, _ in enumerate(per_job_chunksize):
-            row = {
-                "PROC": i,
-                "CHUNKSIZE": per_job_chunksize[i],
-                "CPUS": self.run_options["cores-per-worker"],
-                "MEMORY": self.run_options["mem-per-worker"],
-            }
-            with open(f"{self.jobs_dir}/job_{i}.sub", "w") as f:
-                f.write(render_condor_submit(
-                    Path(f"{self.jobs_dir}/resubmit.sub").read_text(),
-                    [row], "condor@rubin"
-                ))
-            # Let's also create a .idle file to indicate the the job is in idle
-            with open(f"{self.jobs_dir}/job_{i}.idle", "w") as f:
-                f.write("")
+            marker = f"{self.jobs_dir}/job_{i}.idle"
+            open(marker, "w").close()
+            idle_markers.append(marker)
 
         dry_run = self.run_options.get("dry-run", False)
         if dry_run:
@@ -289,7 +278,26 @@ echo 'Done'"""
             return
         else:
             print("Submitting jobs")
-            os.system(f"cd {abs_jobdir_path} && condor_submit jobs_all.sub")
+            try:
+                result = subprocess.run(
+                    ["condor_submit", "jobs_all.sub"], cwd=abs_jobdir_path,
+                    text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                    check=False,
+                )
+            except OSError as exc:
+                submit_error = str(exc)
+            else:
+                submit_error = "" if result.returncode == 0 else (
+                    f"exit code {result.returncode}: {result.stdout.strip()}")
+            if submit_error:
+                for marker in idle_markers:
+                    try:
+                        os.remove(marker)
+                    except FileNotFoundError:
+                        pass
+                raise RuntimeError(
+                    f"condor_submit jobs_all.sub failed: {submit_error}"
+                )
 
 def get_executor_factory(executor_name, **kwargs):
     if executor_name == "iterative":

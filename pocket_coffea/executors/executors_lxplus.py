@@ -1,12 +1,12 @@
 import os
 import sys
 import socket
+import subprocess
 from coffea import processor as coffea_processor
 from .executors_base import ExecutorFactoryABC
 from .executors_manual_jobs import (
     ExecutorFactoryManualABC,
     write_inner_run_options,
-    render_condor_submit,
 )
 from .executors_base import IterativeExecutorFactory, FuturesExecutorFactory
 from pocket_coffea.utils.network import check_port
@@ -17,7 +17,6 @@ import cloudpickle
 import yaml
 import json
 import multiprocessing as mp
-from pathlib import Path
 from statistics import median
 import click
 from rich.console import Console
@@ -87,8 +86,6 @@ def build_condor_job_state(per_job_chunksize, per_job_queue, cpus, memory):
         str(i): {
             "queue": queue,
             "chunksize": chunksize,
-            "base_cpus": cpus,
-            "base_memory": memory,
             "request_cpus": cpus,
             "request_memory": memory,
             "resources_scaled": False,
@@ -571,7 +568,6 @@ class ExecutorFactoryCondorCERN(ExecutorFactoryManualABC):
                     None if self.run_options["ignore-grid-certificate"]
                     else "explicit" if self.run_options.get("voms-proxy") else "default"
                 ),
-                "supports_queue_escalation": True,
             },
             "jobs_list": {}
         }
@@ -777,25 +773,11 @@ class ExecutorFactoryCondorCERN(ExecutorFactoryManualABC):
             for k, v in resubmit_sub.items():
                 f.write(f"{k} = {v}\n")
 
-        # Keep one concrete submit file per job for check-jobs --recreate and
-        # for proactive recreation and current-format inspection.
-        print(f"Creating {len(per_job_chunksize)} .sub files for proactive recreation.")
+        idle_markers = []
         for i, _ in enumerate(per_job_chunksize):
-            row = {
-                "PROC": i,
-                "QUEUE": per_job_queue[i],
-                "CHUNKSIZE": per_job_chunksize[i],
-                "CPUS": self.run_options["cores-per-worker"],
-                "MEMORY": self.run_options["mem-per-worker"],
-            }
-            with open(f"{self.jobs_dir}/job_{i}.sub", "w") as f:
-                f.write(render_condor_submit(
-                    Path(f"{self.jobs_dir}/resubmit.sub").read_text(),
-                    [row], "condor@lxplus"
-                ))
-            # Let's also create a .idle file to indicate the the job is in idle
-            with open(f"{self.jobs_dir}/job_{i}.idle", "w") as f:
-                f.write("")
+            marker = f"{self.jobs_dir}/job_{i}.idle"
+            open(marker, "w").close()
+            idle_markers.append(marker)
 
         dry_run = self.run_options.get("dry-run", False)
         if dry_run:
@@ -803,7 +785,26 @@ class ExecutorFactoryCondorCERN(ExecutorFactoryManualABC):
             return
         else:
             print("Submitting jobs")
-            os.system(f"cd {abs_jobdir_path} && condor_submit jobs_all.sub")
+            try:
+                result = subprocess.run(
+                    ["condor_submit", "jobs_all.sub"], cwd=abs_jobdir_path,
+                    text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                    check=False,
+                )
+            except OSError as exc:
+                submit_error = str(exc)
+            else:
+                submit_error = "" if result.returncode == 0 else (
+                    f"exit code {result.returncode}: {result.stdout.strip()}")
+            if submit_error:
+                for marker in idle_markers:
+                    try:
+                        os.remove(marker)
+                    except FileNotFoundError:
+                        pass
+                raise RuntimeError(
+                    f"condor_submit jobs_all.sub failed: {submit_error}"
+                )
 
 
 def get_executor_factory(executor_name, **kwargs):

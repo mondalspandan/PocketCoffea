@@ -65,12 +65,6 @@ def test_resubmit_failed_without_file(base_path: Path, monkeypatch: pytest.Monke
     assert status != 0
 
 
-def test_manual_job_migration_check_covers_lxplus_and_rubin():
-    from pocket_coffea.scripts.runner import _manual_job_migration_flags
-    options = {"recreate-jobs": "auto"}
-    assert _manual_job_migration_flags("condor@lxplus", options) == ["recreate-jobs"]
-    assert _manual_job_migration_flags("condor@rubin", options) == ["recreate-jobs"]
-    assert _manual_job_migration_flags("iterative", options) == []
 
 
 def test_timeit_worker_count_is_executor_concurrency_not_dataset_count():
