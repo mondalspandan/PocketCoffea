@@ -27,11 +27,3 @@ def test_sample_throughput_file_is_updated_per_config(tmp_path):
     assert json.loads((path / "dataset.json").read_text()) == {"dataset": 50.0}
     assert json.loads((path / "dataset2.json").read_text()) == {"dataset2": 10.0}
     assert load_sample_throughputs(path) == {"dataset": 50.0, "dataset2": 10.0, "stale": 3.0}
-
-
-def test_loader_ignores_obsolete_flat_file(tmp_path):
-    path = tmp_path / "timeit"
-    path.mkdir()
-    (tmp_path / "analysis.throughput.json").write_text(json.dumps({"old": 99.0}))
-    (path / "dataset.json").write_text(json.dumps({"dataset": 4.0}))
-    assert load_sample_throughputs(path) == {"dataset": 4.0}

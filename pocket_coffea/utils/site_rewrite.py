@@ -127,34 +127,25 @@ def _query_replicas(lfn, client=None, scope="cms", sort="random"):
     return [pfn["rse"] for pfn in pfns.values()]
 
 
-def find_other_file(filepath, sitemap, blocklist=None, exclude_urls=None,
+def find_other_file(filepath, sitemap, blocklist=None,
                     fallback_redirector=GLOBAL_XROOTD_REDIRECTOR,
                     rucio_client=None):
     """Find an alternative xrootd location for `filepath`.
 
     Asks Rucio for the file's replicas (via `_query_replicas`) and returns
     the first one served by a site that is (a) present in `sitemap`,
-    (b) not in `blocklist`, (c) different from the file's current site, and
-    (d) whose reconstructed PFN is not in `exclude_urls`.
+    (b) not in `blocklist`, and (c) different from the file's current site.
 
     `blocklist` entries are CMS/Rucio site names (for example
     ``T2_CH_CERN``). XRootD prefixes are resolved from `sitemap` and are not
     accepted as blocklist values.
 
-    `exclude_urls` is an optional iterable of full PFNs that have already
-    failed (check-jobs' ``xrootdfaillist.txt``); a candidate reconstructing
-    to one of them is skipped.
-
     If no suitable replica is found, falls back to
-    ``fallback_redirector + LFN`` — unless `fallback_redirector` is ``None``,
-    in which case the file is returned **unchanged** (used by check-jobs'
-    reactive loop, which prefers "resubmit with the same file" over the
-    redirector). If the URL has no /store/ segment to extract, returns it
-    unchanged with a warning.
+    ``fallback_redirector + LFN``. If the URL has no /store/ segment to
+    extract, returns it unchanged with a warning.
 
     Every site change is logged so the user can audit what was rewritten."""
     blocklist = {normalize_rse(site) for site in (blocklist or [])}
-    exclude_urls = set(exclude_urls or [])
     rootpref, file = _split_lfn(filepath)
 
     if rootpref is None:
@@ -174,18 +165,8 @@ def find_other_file(filepath, sitemap, blocklist=None, exclude_urls=None,
         if rootpref in sitepath or sitepath in rootpref:
             continue
         new_url = sitepath + file
-        # Skip a candidate whose exact PFN has already failed before.
-        if new_url in exclude_urls:
-            continue
         print(f"  [site rewrite] {file}  {cur_site_str} -> {site}  ({rootpref or '<none>'} -> {sitepath})")
         return new_url
-
-    if fallback_redirector is None:
-        # No alternative replica and the caller opted out of the redirector
-        # fallback: leave the file unchanged.
-        print(f"  [site rewrite] {file}  {cur_site_str} -> UNCHANGED  "
-              f"[no alternative replica; blocklist={sorted(blocklist) or None}]")
-        return filepath
 
     new_url = fallback_redirector + file.lstrip("/")
     print(f"  [site rewrite] {file}  {cur_site_str} -> GLOBAL_REDIRECTOR  "

@@ -430,9 +430,9 @@ chunksize:
   DATA_SingleMuon: 300_000      # cheap branches, larger chunks fine
 ```
 
-Each condor job's `.sub` file is then written with **its own** chunksize value
-spliced into the `arguments` line, so the inner `pocket-coffea run --chunksize ...`
-call inside the job picks up the per-sample budget. The CLI flag
+Each condor job's row in `jobs_all.sub` carries **its own** chunksize value in the
+`arguments` line, so the inner `pocket-coffea run --chunksize ...` call inside
+the job picks up the per-sample budget. The CLI flag
 `--chunksize <int>` still works as a global override; it stays an int-only
 parameter (dict form is YAML-only).
 
@@ -582,8 +582,10 @@ at `root://xrootd-cms.infn.it//` (no Rucio); otherwise jobs whose latest `.out` 
 XRootD failure get a per-file alternate-site lookup, and any `--blocklist-sites` files are
 migrated to a non-blocklisted replica (falling back to the redirector if none is found).
 The rewritten fileset is written back into `config_job_{i}.pkl`; the original
-`jobs_config.yaml` is untouched. `--recreate-queue` rewrites the `+JobFlavour` of each
-`.sub` (overriding the implicit one-step bump applied to `.timeout` jobs).
+`jobs_config.yaml` is untouched. `--recreate-queue` overrides the queue stored in
+the candidate recovery state, which is rendered through `resubmit.sub` for the
+replacement submission (overriding the implicit one-step bump applied to
+`.timeout` jobs).
 
 Recreating a job that is still `.running`/`.idle` requires `--remove-running`. check-jobs
 uses the lxplus ClassAd constraint matching the unique `config_job_<n>.pkl` in its
