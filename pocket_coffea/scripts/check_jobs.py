@@ -244,14 +244,19 @@ def merge_inferred_status(idle, running, done, failed, timeout, findings):
 def get_tables(tot_jobs, idle_jobs, running_jobs, done_jobs, failed_jobs,
                timeout=None, details=False):
     failed_jobs = failed_jobs + [job for job in (timeout or []) if job not in failed_jobs]
+    # Summary table
     table1 = Table(title="Job Summary")
     table1.add_column("Total jobs", style="cyan", no_wrap=True)
     table1.add_column("Idle jobs", style="blue", no_wrap=True)
     table1.add_column("Running jobs", style="magenta", no_wrap=True)
     table1.add_column("Done jobs", style="green", no_wrap=True)
     table1.add_column("Failed jobs", style="red", no_wrap=True)
-    table1.add_row(str(len(tot_jobs)), str(len(idle_jobs)),
-                   str(len(running_jobs)), str(len(done_jobs)), str(len(failed_jobs)))
+    table1.add_row(str(len(tot_jobs)),
+                  str(len(idle_jobs)),
+                  str(len(running_jobs)),
+                  str(len(done_jobs)),
+                  str(len(failed_jobs)))
+    # Create a table to display the status
     if details:
         table2 = Table(title="Job Status")
         table2.add_column("Job ID", style="cyan", no_wrap=True)
@@ -260,10 +265,11 @@ def get_tables(tot_jobs, idle_jobs, running_jobs, done_jobs, failed_jobs,
         table2.add_column("Done", style="green", no_wrap=True)
         table2.add_column("Failed", style="red", no_wrap=True)
         for job in tot_jobs:
-            table2.add_row(job, "X" if job in idle_jobs else "",
-                           "X" if job in running_jobs else "",
-                           "X" if job in done_jobs else "",
-                           "X" if job in failed_jobs else "")
+            table2.add_row(job,
+                          "X" if job in idle_jobs else "",
+                          "X" if job in running_jobs else "",
+                          "X" if job in done_jobs else "",
+                          "X" if job in failed_jobs else "")
     else:
         table2 = None
     return table1, table2
@@ -280,6 +286,10 @@ def create_layout(with_progress=False):
         Layout(name="right", ratio=1),
     )
     if with_progress:
+        # Fixed-height summary panel so it doesn't grow at the expense of the
+        # per-group table; 9 rows covers the Panel border + Table title +
+        # header row + data row + a bit of padding. Bumped from 7 to fit
+        # everything without cropping the bottom of the table.
         layout["left"].split_column(
             Layout(name="summary", size=9),
             Layout(name="progress"),
@@ -303,6 +313,7 @@ def get_progress_table(group_counts, label, multi_sample_overlap=False, bar_widt
     table.add_column("Failed", justify="right", style="red")
     table.add_column("Progress", justify="left", no_wrap=True)
     table.add_column("% Done", justify="right")
+
     rows = sorted(group_counts.items(), key=lambda kv: (kv[1]["pct_done"], kv[0]))
     for name, counts in rows:
         pct = f"{counts['pct_done']:.1f}%" if counts["total"] else "n/a"
@@ -504,7 +515,15 @@ def submit_resubmit_jobs(jobs_folder, job_nums, state, state_file, log_text, pen
         state_temp.unlink(missing_ok=True)
         log_text.append(f"[red]Failed to resubmit jobs; state unchanged: {output}[/]")
         return []
-    os.replace(state_temp, state_file)
+    try:
+        os.replace(state_temp, state_file)
+    except Exception as exc:
+        raise RuntimeError(
+            "Condor accepted the replacement, but job_state.json could not be "
+            "committed. Do not rerun automatic recovery until the scheduler "
+            "state is inspected."
+        ) from exc
+    state_temp = None
     state.clear()
     state.update(updated_state)
     for job in states:
@@ -587,11 +606,12 @@ def recreate_jobs_oneshot(jobs_folder, jobs_to_recreate, *, use_redirector=False
         if job in selected_active and (folder / f"{job}.done").exists():
             result["skipped"].append(job)
             continue
-        active = (folder / f"{job}.running").exists() or (folder / f"{job}.idle").exists()
+        was_active = job in selected_active
         config_temp = sub_temp = None
         backup_path = None
         state_temp = None
         scheduler_instance_removed = False
+        submitted_to_scheduler = False
         try:
             fileset = deepcopy(jobs_config["jobs_list"][job]["filesets"])
             if use_redirector:
@@ -632,9 +652,15 @@ def recreate_jobs_oneshot(jobs_folder, jobs_to_recreate, *, use_redirector=False
             updated_state[job_num] = candidate
             state_temp = _write_state_temp(state_file, updated_state)
             prepare_proxy_for_jobs(folder)
-            if active and remove_running:
+            if was_active and remove_running:
+                if (folder / f"{job}.done").exists():
+                    result["skipped"].append(job)
+                    continue
                 ok, output = condor_rm_job(job)
                 if not ok:
+                    if (folder / f"{job}.done").exists():
+                        result["skipped"].append(job)
+                        continue
                     raise RuntimeError(f"condor_rm failed: {output}")
                 if not wait_for_condor_job_removal(job):
                     raise RuntimeError("could not confirm Condor removal")
@@ -651,14 +677,21 @@ def recreate_jobs_oneshot(jobs_folder, jobs_to_recreate, *, use_redirector=False
                 config_path.unlink(missing_ok=True)
                 os.replace(backup_path, config_path)
                 backup_path = None
-                state_temp.unlink(missing_ok=True)
                 if scheduler_instance_removed:
                     mark_job_failed(folder, job)
                 result["failed"][job] = output or "condor_submit failed"
                 continue
-            result["submitted"].append(job)
-            os.replace(state_temp, state_file)
+            submitted_to_scheduler = True
+            try:
+                os.replace(state_temp, state_file)
+            except Exception as exc:
+                raise RuntimeError(
+                    "Condor accepted the replacement, but job_state.json could "
+                    "not be committed. Do not rerun automatic recovery until "
+                    "the scheduler state is inspected."
+                ) from exc
             state_temp = None
+            result["submitted"].append(job)
             state.clear()
             state.update(updated_state)
             try:
@@ -674,22 +707,22 @@ def recreate_jobs_oneshot(jobs_folder, jobs_to_recreate, *, use_redirector=False
                     f"bookkeeping failed; manual inspection is required: {exc}"
                 ) from exc
         except Exception as exc:
-            if job not in result["submitted"] and backup_path and backup_path.exists():
+            if not submitted_to_scheduler and backup_path and backup_path.exists():
                 config_path.unlink(missing_ok=True)
                 os.replace(backup_path, config_path)
-            if state_temp and job not in result["submitted"]:
-                state_temp.unlink(missing_ok=True)
-            if job in result["submitted"]:
+            if submitted_to_scheduler:
                 raise
             else:
                 result["failed"][job] = str(exc)
-            if scheduler_instance_removed and job not in result["submitted"]:
+            if scheduler_instance_removed:
                 mark_job_failed(folder, job)
         finally:
             if config_temp:
                 config_temp.unlink(missing_ok=True)
             if sub_temp:
                 sub_temp.unlink(missing_ok=True)
+            if state_temp and not submitted_to_scheduler:
+                state_temp.unlink(missing_ok=True)
 
     if options_original is not None and not result["submitted"]:
         options_path.write_bytes(options_original)

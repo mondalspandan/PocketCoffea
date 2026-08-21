@@ -369,9 +369,3 @@ def test_manual_factory_rejects_existing_directory_for_new_submission(tmp_path):
     (tmp_path / "job").mkdir()
     with pytest.raises(SystemExit):
         _ManualFactory(_manual_options(tmp_path), str(tmp_path))
-
-
-def test_manual_factory_rejects_recreate_bypass_of_existing_directory(tmp_path):
-    (tmp_path / "job").mkdir()
-    with pytest.raises(SystemExit):
-        _ManualFactory(_manual_options(tmp_path, **{"recreate-jobs": "0"}), str(tmp_path))

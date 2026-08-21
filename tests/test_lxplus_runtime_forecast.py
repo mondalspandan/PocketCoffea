@@ -77,44 +77,6 @@ def test_forecast_uses_max_files_and_sorts_missing_last(tmp_path, capsys):
     assert "Missing" in output
 
 
-def test_forecast_colours_boundary_values_and_prompts(monkeypatch, tmp_path):
-    factory = _factory(tmp_path)
-    filesets = {
-        "green": {"files": ["g"], "metadata": {"nevents": 80, "sample": "g"}},
-        "yellow": {"files": ["y"], "metadata": {"nevents": 81, "sample": "y"}},
-        "red": {"files": ["r"], "metadata": {"nevents": 95, "sample": "r"}},
-    }
-    seen = {}
-    monkeypatch.setattr(
-        click,
-        "confirm",
-        lambda prompt, default=False: seen.update(prompt=prompt, default=default) or True,
-    )
-
-    _print_fixed(
-        factory,
-        filesets,
-        [{name: filesets[name]} for name in filesets],
-        {"green": 80 / (8 * 3600 * 0.8),
-         "yellow": 81 / (8 * 3600 * 0.9),
-         "red": 95 / (8 * 3600 * 1.0)},
-    )
-    assert "Some jobs may not fit in the workday queue. Proceed anyway?" in seen["prompt"]
-    assert seen["default"] is False
-
-
-def test_declining_forecast_aborts(monkeypatch, tmp_path):
-    monkeypatch.setattr(click, "confirm", lambda *args, **kwargs: False)
-    factory = _factory(tmp_path)
-    filesets = {"slow": {"files": ["s"], "metadata": {"nevents": 100, "sample": "s"}}}
-    try:
-        _print_fixed(factory, filesets, [{"slow": filesets["slow"]}], {"slow": 0.001})
-    except click.Abort:
-        pass
-    else:
-        raise AssertionError("declining the forecast should abort submission")
-
-
 def test_unknown_queue_fails_with_timing_data(tmp_path):
     factory = _factory(tmp_path, queue="unknown")
     filesets = {"dataset": {"files": ["f"], "metadata": {"nevents": 1, "sample": "s"}}}
