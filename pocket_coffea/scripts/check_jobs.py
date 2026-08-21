@@ -32,7 +32,7 @@ from pocket_coffea.utils.job_progress import aggregate_by_group, load_job_to_gro
 from pocket_coffea.utils.network import get_proxy_path
 from pocket_coffea.utils.rucio import get_xrootd_sites_map, get_rucio_client
 from pocket_coffea.utils.site_rewrite import (
-    GLOBAL_XROOTD_REDIRECTOR, extract_failed_url, find_other_file, normalize_rse,
+    extract_failed_url, find_other_file, normalize_rse,
     rewrite_fileset_blocklist, rewrite_fileset_to_redirector,
 )
 
@@ -246,36 +246,56 @@ def merge_inferred_status(idle, running, done, failed, timeout, findings):
     return idle, running, done, failed, timeout
 
 
-def get_tables(total, idle, running, done, failed, timeout=None, details=False):
-    timeout = timeout or []
-    failed = failed + [job for job in timeout if job not in failed]
-    table = Table(title="Job Summary")
-    for title, style in (("Total jobs", "cyan"), ("Idle jobs", "blue"),
-                         ("Running jobs", "magenta"), ("Done jobs", "green"),
-                         ("Failed jobs", "red")):
-        table.add_column(title, style=style)
-    table.add_row(str(len(total)), str(len(idle)), str(len(running)),
-                  str(len(done)), str(len(failed)))
-    detail = None
+def get_tables(tot_jobs, idle_jobs, running_jobs, done_jobs, failed_jobs,
+               timeout=None, details=False):
+    failed_jobs = failed_jobs + [job for job in (timeout or []) if job not in failed_jobs]
+    table1 = Table(title="Job Summary")
+    table1.add_column("Total jobs", style="cyan", no_wrap=True)
+    table1.add_column("Idle jobs", style="blue", no_wrap=True)
+    table1.add_column("Running jobs", style="magenta", no_wrap=True)
+    table1.add_column("Done jobs", style="green", no_wrap=True)
+    table1.add_column("Failed jobs", style="red", no_wrap=True)
+    table1.add_row(str(len(tot_jobs)), str(len(idle_jobs)),
+                   str(len(running_jobs)), str(len(done_jobs)), str(len(failed_jobs)))
     if details:
-        detail = Table(title="Job Status")
-        for title in ("Job ID", "Submitted", "Running", "Done", "Failed"):
-            detail.add_column(title)
-        for job in total:
-            detail.add_row(job, "X" if job in idle else "", "X" if job in running else "",
-                           "X" if job in done else "", "X" if job in failed else "")
-    return table, detail
+        table2 = Table(title="Job Status")
+        table2.add_column("Job ID", style="cyan", no_wrap=True)
+        table2.add_column("Submitted", style="blue", no_wrap=True)
+        table2.add_column("Running", style="magenta", no_wrap=True)
+        table2.add_column("Done", style="green", no_wrap=True)
+        table2.add_column("Failed", style="red", no_wrap=True)
+        for job in tot_jobs:
+            table2.add_row(job, "X" if job in idle_jobs else "",
+                           "X" if job in running_jobs else "",
+                           "X" if job in done_jobs else "",
+                           "X" if job in failed_jobs else "")
+    else:
+        table2 = None
+    return table1, table2
 
 
 def create_layout(with_progress=False):
+    """Two-column layout. The left column carries the summary table (and
+    the per-group progress table when `with_progress` is True) and gets
+    twice the width of the log panel on the right, since that's where the
+    interesting content lives."""
     layout = Layout()
-    layout.split_row(Layout(name="left", ratio=2), Layout(name="right", ratio=1))
+    layout.split_row(
+        Layout(name="left", ratio=2),
+        Layout(name="right", ratio=1),
+    )
     if with_progress:
-        layout["left"].split_column(Layout(name="summary", size=9), Layout(name="progress"))
+        layout["left"].split_column(
+            Layout(name="summary", size=9),
+            Layout(name="progress"),
+        )
     return layout
 
 
 def get_progress_table(group_counts, label, multi_sample_overlap=False, bar_width=30):
+    """Build a rich Table showing per-group progress, sorted by % done
+    ascending so straggling groups surface at the top. Includes a stacked
+    coloured progress bar column (done / running / idle / failed)."""
     title = f"Progress by {label}"
     if multi_sample_overlap:
         title += "  [dim](jobs touching multiple samples are counted under each)[/]"
@@ -288,8 +308,8 @@ def get_progress_table(group_counts, label, multi_sample_overlap=False, bar_widt
     table.add_column("Failed", justify="right", style="red")
     table.add_column("Progress", justify="left", no_wrap=True)
     table.add_column("% Done", justify="right")
-    for name, counts in sorted(group_counts.items(),
-                               key=lambda item: (item[1]["pct_done"], item[0])):
+    rows = sorted(group_counts.items(), key=lambda kv: (kv[1]["pct_done"], kv[0]))
+    for name, counts in rows:
         pct = f"{counts['pct_done']:.1f}%" if counts["total"] else "n/a"
         pct_style = "green" if counts["pct_done"] >= 99.5 else (
             "yellow" if counts["pct_done"] >= 50 else "red"
@@ -360,6 +380,15 @@ def save_job_state(state_file, state):
     temp = state_file.with_name(f".{state_file.name}.{os.getpid()}.tmp")
     temp.write_text(json.dumps(state, indent=2, sort_keys=True) + "\n")
     os.replace(temp, state_file)
+
+
+def _write_state_temp(state_file, state):
+    fd, name = tempfile.mkstemp(prefix=f".{Path(state_file).name}.", suffix=".tmp",
+                                dir=Path(state_file).parent)
+    os.close(fd)
+    path = Path(name)
+    path.write_text(json.dumps(state, indent=2, sort_keys=True) + "\n")
+    return path
 
 
 def _atomic_copy_proxy(source, target):
@@ -474,23 +503,38 @@ def submit_resubmit_jobs(jobs_folder, job_nums, state, state_file, log_text, pen
     folder, _, submission, _, _ = load_current_contract(jobs_folder)
     pending = pending or {}
     states = {job: deepcopy(pending.get(f"job_{job}", state[job])) for job in job_nums}
+    updated_state = deepcopy(state)
+    for job, candidate in states.items():
+        committed = deepcopy(candidate)
+        committed["resubmissions"] = int(state[job]["resubmissions"]) + 1
+        updated_state[job] = committed
     (folder / "resubmit_now.sub").write_text(render_states(folder, submission, states))
+    state_temp = None
     try:
+        state_temp = _write_state_temp(state_file, updated_state)
         prepare_proxy_for_jobs(folder)
     except Exception as exc:
+        if state_temp:
+            state_temp.unlink(missing_ok=True)
         log_text.append(f"[red]Could not prepare proxy for resubmission: {exc}[/]")
         return []
     ok, output = condor_submit_job(folder, "resubmit_now.sub")
     if not ok:
+        state_temp.unlink(missing_ok=True)
         log_text.append(f"[red]Failed to resubmit jobs; state unchanged: {output}[/]")
         return []
-    for job, candidate in states.items():
-        committed = deepcopy(candidate)
-        committed["resubmissions"] = int(state[job]["resubmissions"]) + 1
-        state[job] = committed
-        materialize_job_submit_state(folder, job, state)
-        mark_job_idle(folder, f"job_{job}")
-    save_job_state(state_file, state)
+    os.replace(state_temp, state_file)
+    state.clear()
+    state.update(updated_state)
+    for job in states:
+        try:
+            mark_job_idle(folder, f"job_{job}")
+        except Exception as exc:
+            log_text.append(f"[yellow]Resubmitted job_{job}, but could not update its marker: {exc}[/]")
+        try:
+            materialize_job_submit_state(folder, job, state)
+        except Exception as exc:
+            log_text.append(f"[yellow]Resubmitted job_{job}, but could not materialize its submit file: {exc}[/]")
     log_text.append(f"[green]Resubmitted {len(states)} failed jobs to condor[/]")
     return list(states)
 
@@ -549,7 +593,8 @@ def recreate_jobs_oneshot(jobs_folder, jobs_to_recreate, *, use_redirector=False
             continue
         config_temp = sub_temp = None
         backup_path = None
-        removed = not active
+        state_temp = None
+        scheduler_instance_removed = False
         try:
             fileset = deepcopy(jobs_config["jobs_list"][job]["filesets"])
             if use_redirector:
@@ -585,6 +630,10 @@ def recreate_jobs_oneshot(jobs_folder, jobs_to_recreate, *, use_redirector=False
             sub_temp = Path(name)
             sub_temp.write_text(render_condor_submit(
                 (folder / "resubmit.sub").read_text(), [row], submission["executor"]))
+            candidate["resubmissions"] = int(state[job_num]["resubmissions"]) + 1
+            updated_state = deepcopy(state)
+            updated_state[job_num] = candidate
+            state_temp = _write_state_temp(state_file, updated_state)
             prepare_proxy_for_jobs(folder)
             if active and remove_running:
                 ok, output = condor_rm_job(job)
@@ -592,7 +641,7 @@ def recreate_jobs_oneshot(jobs_folder, jobs_to_recreate, *, use_redirector=False
                     raise RuntimeError(f"condor_rm failed: {output}")
                 if not wait_for_condor_job_removal(job):
                     raise RuntimeError("could not confirm Condor removal")
-                removed = True
+                scheduler_instance_removed = True
 
             backup_path = config_path.with_name(f".{config_path.name}.{os.getpid()}.bak")
             os.replace(config_path, backup_path)
@@ -602,23 +651,40 @@ def recreate_jobs_oneshot(jobs_folder, jobs_to_recreate, *, use_redirector=False
                 config_path.unlink(missing_ok=True)
                 os.replace(backup_path, config_path)
                 backup_path = None
-                mark_job_failed(folder, job)
+                state_temp.unlink(missing_ok=True)
+                if scheduler_instance_removed:
+                    mark_job_failed(folder, job)
                 result["failed"][job] = output or "condor_submit failed"
                 continue
-            backup_path.unlink(missing_ok=True)
-            backup_path = None
-            os.replace(sub_temp, folder / f"{job}.sub")
-            candidate["resubmissions"] = int(state[job_num]["resubmissions"]) + 1
-            state[job_num] = candidate
-            save_job_state(state_file, state)
-            mark_job_idle(folder, job)
             result["submitted"].append(job)
+            os.replace(state_temp, state_file)
+            state_temp = None
+            state.clear()
+            state.update(updated_state)
+            try:
+                backup_path.unlink(missing_ok=True)
+                backup_path = None
+            except Exception as exc:
+                rprint(f"[yellow]{job} was submitted, but could not remove the config backup: {exc}[/]")
+            try:
+                os.replace(sub_temp, folder / f"{job}.sub")
+            except Exception as exc:
+                rprint(f"[yellow]{job} was submitted, but could not update its submit file: {exc}[/]")
+            try:
+                mark_job_idle(folder, job)
+            except Exception as exc:
+                rprint(f"[yellow]{job} was submitted, but could not update its marker: {exc}[/]")
         except Exception as exc:
-            if backup_path and backup_path.exists():
+            if job not in result["submitted"] and backup_path and backup_path.exists():
                 config_path.unlink(missing_ok=True)
                 os.replace(backup_path, config_path)
-            result["failed"][job] = str(exc)
-            if removed:
+            if state_temp and job not in result["submitted"]:
+                state_temp.unlink(missing_ok=True)
+            if job in result["submitted"]:
+                rprint(f"[yellow]{job} was submitted, but local bookkeeping failed: {exc}[/]")
+            else:
+                result["failed"][job] = str(exc)
+            if scheduler_instance_removed and job not in result["submitted"]:
                 mark_job_failed(folder, job)
         finally:
             if config_temp:
@@ -636,25 +702,38 @@ def recreate_jobs_oneshot(jobs_folder, jobs_to_recreate, *, use_redirector=False
 
 
 @click.command()
-@click.option("-j", "--jobs-folder", required=True, type=str)
-@click.option("-d", "--details", is_flag=True)
-@click.option("-r", "--resubmit", is_flag=True)
-@click.option("-m", "--max-resubmit", type=click.IntRange(min=0), default=4)
-@click.option("-q", "--queue-shift", type=click.IntRange(min=0), default=1)
-@click.option("-n", "--ncpu", type=click.IntRange(min=1), default=1)
-@click.option("--by", "group_by", type=click.Choice(["sample", "dataset", "none"]), default="sample")
-@click.option("--recreate", type=str, default=None)
-@click.option("--once", is_flag=True, default=False)
-@click.option("--use-redirector", is_flag=True, default=False)
-@click.option("--blocklist-sites", type=str, default=None)
-@click.option("--recreate-queue", type=str, default=None)
-@click.option("--skip-bad-files", is_flag=True, default=False)
-@click.option("--remove-running", is_flag=True, default=False)
+@click.option("-j", "--jobs-folder", type=str, help="Folder containing the jobs", required=True)
+@click.option("-d", "--details", is_flag=True, help="Show the details of the jobs")
+@click.option("-r", "--resubmit", is_flag=True, help="Resubmit the failed jobs")
+@click.option("-m", "--max-resubmit", type=click.IntRange(min=0),
+              help="Maximum number of resubmission", default=4)
+@click.option("-q", "--queue-shift", type=click.IntRange(min=0),
+              help="How many queues to bump to if a job is removed due to time limit? "
+                   "E.g. 1 = bump to next queue, 2 = bump to next-to-next queue", default=1)
+@click.option("-n", "--ncpu", type=click.IntRange(min=1), default=1,
+              help="CPU count for recovery submissions")
+@click.option("--by", "group_by", type=click.Choice(["sample", "dataset", "none"]),
+              default="sample",
+              help="Show a per-group progress table below the summary. Requires "
+                   "jobs_config.yaml in the jobs folder (created by manual-job "
+                   "executors). Pass 'none' to disable. Default: sample.")
+@click.option("--recreate", type=str, default=None, help="Recreate selected jobs")
+@click.option("--once", is_flag=True, default=False, help="Run one monitoring pass")
+@click.option("--use-redirector", is_flag=True, default=False,
+              help="Use the global XRootD redirector when recreating")
+@click.option("--blocklist-sites", type=str, default=None,
+              help="Comma-separated CMS/Rucio sites to block when recreating")
+@click.option("--recreate-queue", type=str, default=None,
+              help="Queue to use for recreated lxplus jobs")
+@click.option("--skip-bad-files", is_flag=True, default=False,
+              help="Skip the file recorded as bad during recreation")
+@click.option("--remove-running", is_flag=True, default=False,
+              help="Remove active Condor jobs before recreation")
 @_with_check_jobs_lock
 def check_jobs(jobs_folder, details, resubmit, max_resubmit, queue_shift, ncpu, group_by,
                recreate, once, use_redirector, blocklist_sites, recreate_queue,
                skip_bad_files, remove_running):
-    folder, config, submission, state, state_file = load_current_contract(jobs_folder)
+    folder, _, submission, state, state_file = load_current_contract(jobs_folder)
     blocklist = (
         [site.strip() for site in blocklist_sites.split(",") if site.strip()]
         if blocklist_sites else []
@@ -677,7 +756,7 @@ def check_jobs(jobs_folder, details, resubmit, max_resubmit, queue_shift, ncpu, 
             raise click.exceptions.Exit(1)
         if not resubmit:
             return
-        folder, config, submission, state, state_file = load_current_contract(folder)
+        folder, _, submission, state, state_file = load_current_contract(folder)
 
     total = [f"job_{job}" for job in state]
     groups = None

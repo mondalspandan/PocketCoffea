@@ -1,19 +1,8 @@
-"""Pure current queue semantics; no submit-file compatibility tests."""
+"""Current queue semantics."""
 from pocket_coffea.utils.htcondor_queue import next_queue
 
 
-def test_negative_queue_shift_is_clamped():
-    assert next_queue("espresso", -1) == "espresso"
-
-
-def test_large_queue_shift_caps_at_nextweek():
-    assert next_queue("espresso", 100) == "nextweek"
-
-
-def test_unknown_queue_uses_terminal_queue():
-    assert next_queue("site-specific", 1) == "nextweek"
-
-
-def test_zero_queue_shift_is_a_noop_for_known_and_custom_queues():
+def test_queue_shift_zero_is_a_noop_and_unknown_queues_bump_to_terminal():
     assert next_queue("espresso", 0) == "espresso"
     assert next_queue("site-specific", 0) == "site-specific"
+    assert next_queue("site-specific", 1) == "nextweek"

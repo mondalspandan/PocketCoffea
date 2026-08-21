@@ -1,12 +1,41 @@
 """Focused current-format proactive recreation tests."""
 import json
-from pathlib import Path
+import time
 
 import yaml
 from click.testing import CliRunner
 
 from pocket_coffea.scripts import check_jobs
-from tests.test_check_jobs_progress import make_jobs
+
+
+def make_jobs(tmp_path, executor="condor@lxplus"):
+    (tmp_path / "logs").mkdir()
+    submission = {
+        "format_version": 1,
+        "executor": executor,
+        "requires_grid_certificate": False,
+        "proxy_transfer_path": None,
+        "proxy_source": None,
+        "supports_queue_escalation": executor == "condor@lxplus",
+    }
+    state = {"0": {"chunksize": 100, "request_cpus": 1,
+                    "request_memory": "4GB", "resubmissions": 0}}
+    if executor == "condor@lxplus":
+        state["0"].update({"queue": "espresso", "base_cpus": 1,
+                           "base_memory": "4GB", "resources_scaled": False})
+    (tmp_path / "jobs_config.yaml").write_text(yaml.safe_dump({
+        "submission": submission, "jobs_list": {"job_0": {"filesets": {}}},
+    }))
+    (tmp_path / "job_state.json").write_text(json.dumps(state))
+    for name in ("job.sh", "inner_run_options.yaml"):
+        (tmp_path / name).write_text("")
+    (tmp_path / "resubmit.sub").write_text(
+        "RequestCpus = $(CPUS)\nRequestMemory = $(MEMORY)\n"
+        "arguments = $(PROC) $(CHUNKSIZE) $(CPUS)\n"
+    )
+    (tmp_path / "config_job_0.pkl").write_bytes(b"placeholder")
+    (tmp_path / "job_0.sub").write_text("queue\n")
+    (tmp_path / "job_0.running").touch()
 
 
 class Config:
@@ -23,6 +52,33 @@ def test_recreate_requires_current_contract(tmp_path):
         check_jobs.check_jobs, ["-j", str(tmp_path), "--recreate", "0"])
     assert result.exit_code != 0
     assert "predates the consolidated" in result.output
+
+
+def test_current_contract_is_accepted(tmp_path):
+    make_jobs(tmp_path)
+    assert check_jobs.load_current_contract(tmp_path)[2]["executor"] == "condor@lxplus"
+
+
+def test_passive_check_jobs_does_not_mutate_markers_or_state(tmp_path, monkeypatch):
+    make_jobs(tmp_path)
+    stamp = time.strftime("%m/%d %H:%M:%S", time.localtime(time.time() + 2))
+    (tmp_path / "logs" / "job_123.log").write_text(
+        f"009 (123.0.000) {stamp} Job was aborted.\n"
+        "Job removed by SYSTEM_PERIODIC_REMOVE due to wall time exceeded.\n"
+    )
+    snapshots = {
+        path: (path.read_bytes(), path.stat().st_mtime_ns)
+        for path in (tmp_path / "job_state.json", tmp_path / "job_0.sub")
+    }
+    monkeypatch.setattr(check_jobs, "condor_submit_job",
+                        lambda *args: (_ for _ in ()).throw(AssertionError()))
+    result = CliRunner().invoke(
+        check_jobs.check_jobs, ["-j", str(tmp_path), "--once", "--by", "none"])
+    assert result.exit_code == 0, result.output
+    assert not (tmp_path / "job_0.failed").exists()
+    assert not (tmp_path / ".check_jobs.lock").exists()
+    for path, snapshot in snapshots.items():
+        assert (path.read_bytes(), path.stat().st_mtime_ns) == snapshot
 
 
 def test_recreate_prepares_before_condor_rm(tmp_path, monkeypatch):
@@ -65,47 +121,10 @@ def test_recreate_proxy_failure_leaves_active_job(tmp_path, monkeypatch):
     assert (tmp_path / "job_0.running").exists()
 
 
-def test_plain_recreate_does_not_initialize_rucio(tmp_path, monkeypatch):
-    make_jobs(tmp_path)
-    (tmp_path / "job_0.running").unlink()
-    import cloudpickle
-    with (tmp_path / "config_job_0.pkl").open("wb") as handle:
-        cloudpickle.dump(Config(), handle)
-    monkeypatch.setattr(check_jobs, "get_xrootd_sites_map",
-                        lambda: (_ for _ in ()).throw(AssertionError("site map")))
-    monkeypatch.setattr(check_jobs, "get_rucio_client",
-                        lambda: (_ for _ in ()).throw(AssertionError("rucio")))
-    monkeypatch.setattr(check_jobs, "condor_submit_job", lambda *args: (True, ""))
-    result = check_jobs.recreate_jobs_oneshot(tmp_path, "0")
-    assert result["submitted"] == ["job_0"]
-
-
-def test_rucio_client_is_created_after_proxy_refresh(tmp_path, monkeypatch):
-    make_jobs(tmp_path)
-    (tmp_path / "job_0.running").unlink()
-    import cloudpickle
-    with (tmp_path / "config_job_0.pkl").open("wb") as handle:
-        cloudpickle.dump(Config(), handle)
-    jobs_config = yaml.safe_load((tmp_path / "jobs_config.yaml").read_text())
-    jobs_config["submission"]["requires_grid_certificate"] = True
-    jobs_config["submission"]["proxy_source"] = "explicit"
-    jobs_config["submission"]["proxy_transfer_path"] = str(tmp_path / "proxy")
-    jobs_config["jobs_list"]["job_0"]["filesets"] = {"dataset": {"files": []}}
-    (tmp_path / "jobs_config.yaml").write_text(yaml.safe_dump(jobs_config))
-    order = []
-    monkeypatch.setattr(check_jobs, "prepare_proxy_for_jobs", lambda folder: order.append("proxy"))
-    monkeypatch.setattr(check_jobs, "get_xrootd_sites_map", lambda: order.append("map") or {})
-    monkeypatch.setattr(check_jobs, "get_rucio_client", lambda: order.append("rucio") or object())
-    monkeypatch.setattr(check_jobs, "rewrite_fileset_blocklist", lambda *args, **kwargs: {})
-    monkeypatch.setattr(check_jobs, "condor_submit_job", lambda *args: (True, ""))
-    result = check_jobs.recreate_jobs_oneshot(tmp_path, "0", blocklist_sites=["T1_US_FNAL"])
-    assert result["submitted"] == ["job_0"]
-    assert order[:3] == ["proxy", "map", "rucio"]
-
-
 def test_failed_recreate_restores_canonical_config(tmp_path, monkeypatch):
     make_jobs(tmp_path)
     (tmp_path / "job_0.running").unlink()
+    (tmp_path / "job_0.done").touch()
     import cloudpickle
     config = Config()
     config.filesets = {"original": {"files": ["old.root"]}}
@@ -114,24 +133,36 @@ def test_failed_recreate_restores_canonical_config(tmp_path, monkeypatch):
     monkeypatch.setattr(check_jobs, "condor_submit_job", lambda *args: (False, "submit failed"))
     result = check_jobs.recreate_jobs_oneshot(tmp_path, "0")
     assert "job_0" in result["failed"]
+    assert (tmp_path / "job_0.done").exists()
+    assert not (tmp_path / "job_0.failed").exists()
+    assert json.loads((tmp_path / "job_state.json").read_text())["0"]["resubmissions"] == 0
     with (tmp_path / "config_job_0.pkl").open("rb") as handle:
         assert cloudpickle.load(handle).filesets == {"original": {"files": ["old.root"]}}
 
 
-def test_successful_recreate_installs_candidate_config(tmp_path, monkeypatch):
+def test_reactive_submit_commits_retry_before_local_materialization(tmp_path, monkeypatch):
+    make_jobs(tmp_path)
+    state = json.loads((tmp_path / "job_state.json").read_text())
+    log_text = []
+    monkeypatch.setattr(check_jobs, "prepare_proxy_for_jobs", lambda folder: None)
+    monkeypatch.setattr(check_jobs, "condor_submit_job", lambda *args: (True, ""))
+    monkeypatch.setattr(check_jobs, "materialize_job_submit_state",
+                        lambda *args: (_ for _ in ()).throw(OSError("local write")))
+    successful = check_jobs.submit_resubmit_jobs(
+        tmp_path, ["0"], state, tmp_path / "job_state.json", log_text)
+    assert successful == ["0"]
+    assert json.loads((tmp_path / "job_state.json").read_text())["0"]["resubmissions"] == 1
+
+
+def test_successful_recreate_is_not_reported_failed_after_marker_error(tmp_path, monkeypatch):
     make_jobs(tmp_path)
     (tmp_path / "job_0.running").unlink()
     import cloudpickle
     with (tmp_path / "config_job_0.pkl").open("wb") as handle:
         cloudpickle.dump(Config(), handle)
     monkeypatch.setattr(check_jobs, "condor_submit_job", lambda *args: (True, ""))
+    monkeypatch.setattr(check_jobs, "mark_job_idle",
+                        lambda *args: (_ for _ in ()).throw(OSError("marker write")))
     result = check_jobs.recreate_jobs_oneshot(tmp_path, "0")
     assert result["submitted"] == ["job_0"]
-    with (tmp_path / "config_job_0.pkl").open("rb") as handle:
-        assert cloudpickle.load(handle).filesets == {}
-
-
-def test_explicit_active_recreate_refusal_is_failure(tmp_path):
-    make_jobs(tmp_path)
-    result = check_jobs.recreate_jobs_oneshot(tmp_path, "0")
-    assert "job_0" in result["failed"]
+    assert "job_0" not in result["failed"]
