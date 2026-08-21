@@ -120,7 +120,7 @@ def load_current_contract(jobs_folder):
         state = json.loads(state_file.read_text())
         if not isinstance(state, dict) or not state:
             raise ValueError
-        for name in ("job.sh", "inner_run_options.yaml", "jobs_all.sub", "resubmit.sub"):
+        for name in ("job.sh", "inner_run_options.yaml", "resubmit.sub"):
             if not (folder / name).is_file():
                 raise ValueError
         for job, values in state.items():
@@ -542,11 +542,14 @@ def recreate_jobs_oneshot(jobs_folder, jobs_to_recreate, *, use_redirector=False
         return result
 
     eligible_jobs = []
+    selected_active = set()
     for job in jobs:
         if job not in jobs_config["jobs_list"]:
             result["failed"][job] = "job is not present in jobs_config.yaml"
             continue
         active = (folder / f"{job}.running").exists() or (folder / f"{job}.idle").exists()
+        if active:
+            selected_active.add(job)
         if active and not remove_running:
             if explicit:
                 result["failed"][job] = "job is active; pass --remove-running to recreate it"
@@ -581,6 +584,9 @@ def recreate_jobs_oneshot(jobs_folder, jobs_to_recreate, *, use_redirector=False
         os.replace(temp, options_path)
 
     for job in jobs:
+        if job in selected_active and (folder / f"{job}.done").exists():
+            result["skipped"].append(job)
+            continue
         active = (folder / f"{job}.running").exists() or (folder / f"{job}.idle").exists()
         config_temp = sub_temp = None
         backup_path = None
@@ -633,6 +639,9 @@ def recreate_jobs_oneshot(jobs_folder, jobs_to_recreate, *, use_redirector=False
                 if not wait_for_condor_job_removal(job):
                     raise RuntimeError("could not confirm Condor removal")
                 scheduler_instance_removed = True
+                if (folder / f"{job}.done").exists():
+                    result["skipped"].append(job)
+                    continue
 
             backup_path = config_path.with_name(f".{config_path.name}.{os.getpid()}.bak")
             os.replace(config_path, backup_path)

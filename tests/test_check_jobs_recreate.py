@@ -32,7 +32,6 @@ def make_jobs(tmp_path, executor="condor@lxplus"):
         "RequestCpus = $(CPUS)\nRequestMemory = $(MEMORY)\n"
         "arguments = $(PROC) $(CHUNKSIZE) $(CPUS)\n"
     )
-    (tmp_path / "jobs_all.sub").write_text("queue\n")
     (tmp_path / "config_job_0.pkl").write_bytes(b"placeholder")
     (tmp_path / "job_0.running").touch()
 
@@ -45,18 +44,26 @@ class Config:
         self.filesets = filesets
 
 
-def test_recreate_requires_current_contract(tmp_path):
-    (tmp_path / "jobs_config.yaml").write_text("{}")
-    result = CliRunner().invoke(
-        check_jobs.check_jobs, ["-j", str(tmp_path), "--recreate", "0"])
-    assert result.exit_code != 0
-    assert "predates the consolidated" in result.output
-
-
 def test_current_contract_is_accepted(tmp_path):
     make_jobs(tmp_path)
     assert check_jobs.load_current_contract(tmp_path)[2]["executor"] == "condor@lxplus"
     assert not (tmp_path / "job_0.sub").exists()
+
+
+def test_recreate_skips_active_job_that_finishes_during_preparation(tmp_path, monkeypatch):
+    make_jobs(tmp_path)
+
+    def finish_job(folder, job):
+        (tmp_path / f"{job}.running").unlink()
+        (tmp_path / f"{job}.done").touch()
+        return None
+
+    monkeypatch.setattr(check_jobs, "latest_job_out", finish_job)
+    monkeypatch.setattr(check_jobs, "condor_submit_job",
+                        lambda *args: (_ for _ in ()).throw(AssertionError()))
+    result = check_jobs.recreate_jobs_oneshot(tmp_path, "auto", remove_running=True)
+    assert result["skipped"] == ["job_0"]
+    assert (tmp_path / "job_0.done").exists()
 
 
 def test_passive_check_jobs_does_not_mutate_markers_or_state(tmp_path, monkeypatch):

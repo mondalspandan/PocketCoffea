@@ -266,38 +266,37 @@ echo 'Done'"""
             import json
             json.dump(job_state, f, indent=2, sort_keys=True)
 
+        dry_run = self.run_options.get("dry-run", False)
+        if dry_run:
+            print(f"Dry run, not submitting jobs. You can find all files: {abs_jobdir_path}")
+            return
         idle_markers = []
         for i, _ in enumerate(per_job_chunksize):
             marker = f"{self.jobs_dir}/job_{i}.idle"
             open(marker, "w").close()
             idle_markers.append(marker)
 
-        dry_run = self.run_options.get("dry-run", False)
-        if dry_run:
-            print(f"Dry run, not submitting jobs. You can find all files: {abs_jobdir_path}")
-            return
+        print("Submitting jobs")
+        try:
+            result = subprocess.run(
+                ["condor_submit", "jobs_all.sub"], cwd=abs_jobdir_path,
+                text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                check=False,
+            )
+        except OSError as exc:
+            submit_error = str(exc)
         else:
-            print("Submitting jobs")
-            try:
-                result = subprocess.run(
-                    ["condor_submit", "jobs_all.sub"], cwd=abs_jobdir_path,
-                    text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                    check=False,
-                )
-            except OSError as exc:
-                submit_error = str(exc)
-            else:
-                submit_error = "" if result.returncode == 0 else (
-                    f"exit code {result.returncode}: {result.stdout.strip()}")
-            if submit_error:
-                for marker in idle_markers:
-                    try:
-                        os.remove(marker)
-                    except FileNotFoundError:
-                        pass
-                raise RuntimeError(
-                    f"condor_submit jobs_all.sub failed: {submit_error}"
-                )
+            submit_error = "" if result.returncode == 0 else (
+                f"exit code {result.returncode}: {result.stdout.strip()}")
+        if submit_error:
+            for marker in idle_markers:
+                try:
+                    os.remove(marker)
+                except FileNotFoundError:
+                    pass
+            raise RuntimeError(
+                f"condor_submit jobs_all.sub failed: {submit_error}"
+            )
 
 def get_executor_factory(executor_name, **kwargs):
     if executor_name == "iterative":
