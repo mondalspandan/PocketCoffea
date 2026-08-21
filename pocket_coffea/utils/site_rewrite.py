@@ -1,8 +1,8 @@
 """Helpers for rewriting xrootd URLs in a manual-job fileset.
 
-Used by `scripts/check_jobs.py` (the `check-jobs --resubmit` / `--recreate`
-tooling) to migrate files away from a blocklisted CMS site and to recover
-from per-file XRootD errors.
+Used by proactive `check-jobs --recreate` and worker-side XRootD recovery
+through `scripts/rewrite_xrootd_site.py` to migrate files away from a
+blocklisted CMS site and recover from per-file XRootD errors.
 
 Replica lookups go through the Rucio client (same path as
 `pocket_coffea.utils.rucio.get_dataset_files_replicas`), so the tools

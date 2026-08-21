@@ -77,6 +77,26 @@ def test_forecast_uses_max_files_and_sorts_missing_last(tmp_path, capsys):
     assert "Missing" in output
 
 
+def test_fixed_forecast_sums_mixed_dataset_job(monkeypatch, tmp_path, capsys):
+    factory = _factory(tmp_path)
+    filesets = {
+        "A": {"files": ["a"], "metadata": {"nevents": 12_600}},
+        "B": {"files": ["b"], "metadata": {"nevents": 12_600}},
+    }
+    monkeypatch.setattr(click, "confirm", lambda *args, **kwargs: True)
+
+    _print_fixed(
+        factory,
+        filesets,
+        [{"A": filesets["A"], "B": filesets["B"]}],
+        {"A": 1.0, "B": 1.0},
+    )
+
+    output = capsys.readouterr().out
+    assert "7h00m" in output
+    assert "87.5%" in output
+
+
 def test_unknown_queue_fails_with_timing_data(tmp_path):
     factory = _factory(tmp_path, queue="unknown")
     filesets = {"dataset": {"files": ["f"], "metadata": {"nevents": 1, "sample": "s"}}}

@@ -487,7 +487,11 @@ class ExecutorFactoryCondorCERN(ExecutorFactoryManualABC):
             )
 
         rows = []
-        workers = max(1, int(self.run_options["cores-per-worker"]))
+        whole_job_seconds = job_seconds if auto else [
+            None if any(dataset not in rates for dataset in job)
+            else self._job_runtime_seconds(filesets, [job], rates)[0]
+            for job in jobs
+        ]
         for dataset, fileset in filesets.items():
             rate = rates.get(dataset)
             if rate is None and not auto:
@@ -501,12 +505,9 @@ class ExecutorFactoryCondorCERN(ExecutorFactoryManualABC):
             for index, job in enumerate(jobs):
                 if dataset not in job:
                     continue
-                if auto:
-                    seconds = job_seconds[index]
-                else:
-                    average_events = int(fileset["metadata"]["nevents"]) / nfiles
-                    seconds = len(job[dataset]["files"]) * average_events / (rate * workers)
-                candidates.append((seconds, per_job_queue[index]))
+                seconds = whole_job_seconds[index]
+                if seconds is not None:
+                    candidates.append((seconds, per_job_queue[index]))
             if not candidates:
                 rows.append((1, 0, dataset, None, None))
                 continue
