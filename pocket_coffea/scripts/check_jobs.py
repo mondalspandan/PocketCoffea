@@ -24,6 +24,7 @@ from rich.console import Console
 from rich.live import Live
 from rich.layout import Layout
 from rich.panel import Panel
+from rich.progress import BarColumn, Progress, TextColumn
 from rich.table import Table
 
 from pocket_coffea.executors.executors_manual_jobs import render_condor_submit
@@ -66,7 +67,7 @@ def _new_lock_info():
     }
 
 
-def acquire_check_jobs_lock(jobs_folder):
+def acquire_check_jobs_lock(jobs_folder, ignore_lock=False):
     path = Path(jobs_folder) / LOCK_FILENAME
     info = _new_lock_info()
     try:
@@ -76,8 +77,8 @@ def acquire_check_jobs_lock(jobs_folder):
             fcntl.flock(handle, fcntl.LOCK_EX)
             existing = json.load(handle)
             rprint(f"[yellow]check-jobs is already running on {existing.get('hostname', 'unknown host')} "
-                   f"(PID {existing.get('pid', 'unknown')}).[/]")
-            if not click.confirm("Proceed anyway despite the risk?", default=False):
+                   f"(PID {existing.get('pid', 'unknown')}). Use --ignore-lock to skip this check (risky!).[/]")
+            if not ignore_lock:
                 return None
             handle.seek(0)
             handle.truncate()
@@ -140,19 +141,39 @@ def load_current_contract(jobs_folder):
 def _with_check_jobs_lock(function):
     @wraps(function)
     def wrapped(*args, **kwargs):
-        folder = _resolve_jobs_folder(kwargs["jobs_folder"])
-        load_current_contract(folder)
-        if not (kwargs.get("resubmit") or kwargs.get("recreate") is not None):
-            kwargs["jobs_folder"] = folder
-            return function(*args, **kwargs)
-        lock = acquire_check_jobs_lock(folder)
-        if lock is None:
-            return None
-        kwargs["jobs_folder"] = folder
+        startup_progress = Progress(
+            TextColumn("Launching check-jobs"),
+            BarColumn(),
+            TextColumn("[progress.description]{task.description}"),
+            TextColumn("{task.completed}/{task.total}"),
+        )
+        startup_progress.start()
+        startup_task = startup_progress.add_task(
+            "Validating jobs contract", total=5 if kwargs.get("resubmit") else 4)
+        startup_progress.refresh()
+        lock = None
         try:
+            folder = _resolve_jobs_folder(kwargs["jobs_folder"])
+            needs_lock = kwargs.get("resubmit") or kwargs.get("recreate") is not None
+            if needs_lock:
+                startup_progress.update(startup_task, description="Acquiring check-jobs lock")
+                startup_progress.refresh()
+                lock = acquire_check_jobs_lock(folder, kwargs.get("ignore_lock", False))
+                if lock is None:
+                    return None
+            contract = load_current_contract(folder)
+            startup_progress.advance(startup_task)
+            kwargs["jobs_folder"] = folder
+            if not needs_lock:
+                startup_progress.update(startup_task, description="Other startup steps")
+                startup_progress.refresh()
+            kwargs["_startup_progress"] = (startup_progress, startup_task)
+            kwargs["_startup_contract"] = contract
             return function(*args, **kwargs)
         finally:
-            release_check_jobs_lock(folder, lock["session_id"])
+            if lock is not None:
+                release_check_jobs_lock(folder, lock["session_id"])
+            startup_progress.stop()
     return wrapped
 
 
@@ -173,7 +194,10 @@ def scan_condor_log_failures(jobs_folder, log_offsets):
             job = path.stem
             if any((folder / f"{job}.{term}").exists() for term in ("done", "failed", "timeout")):
                 continue
-            active[job] = path.stat().st_mtime
+            try:
+                active[job] = path.stat().st_mtime
+            except FileNotFoundError:
+                continue
     recovered = {}
     for path in (folder / "logs").glob("job_*.log"):
         key = str(path)
@@ -764,11 +788,28 @@ def recreate_jobs_oneshot(jobs_folder, jobs_to_recreate, *, use_redirector=False
               help="Enable Coffea skip-bad-files in the shared inner worker options")
 @click.option("--remove-running", is_flag=True, default=False,
               help="Remove active Condor jobs before recreation")
+@click.option("--ignore-lock", is_flag=True, default=False,
+              help="Ignore an existing check-jobs lock (risky)")
 @_with_check_jobs_lock
 def check_jobs(jobs_folder, details, resubmit, max_resubmit, queue_shift, ncpu, group_by,
                recreate, once, use_redirector, blocklist_sites, recreate_queue,
-               skip_bad_files, remove_running):
-    folder, _, submission, state, state_file = load_current_contract(jobs_folder)
+               skip_bad_files, remove_running, ignore_lock, _startup_progress=None,
+               _startup_contract=None):
+    if _startup_contract is None:
+        folder, _, submission, state, state_file = load_current_contract(jobs_folder)
+    else:
+        folder, _, submission, state, state_file = _startup_contract
+    startup_progress, startup_task = _startup_progress or (None, None)
+
+    def show_startup_step(description):
+        if startup_progress is not None:
+            startup_progress.update(startup_task, description=description)
+            startup_progress.refresh()
+
+    def advance_startup_step():
+        if startup_progress is not None:
+            startup_progress.advance(startup_task)
+
     blocklist = (
         [site.strip() for site in blocklist_sites.split(",") if site.strip()]
         if blocklist_sites else []
@@ -782,6 +823,7 @@ def check_jobs(jobs_folder, details, resubmit, max_resubmit, queue_shift, ncpu, 
                                  skip_bad_files, remove_running)):
         raise click.UsageError("recreate-only options require --recreate")
     if recreate is not None:
+        show_startup_step("Other startup steps")
         result = recreate_jobs_oneshot(
             folder, recreate, use_redirector=use_redirector,
             blocklist_sites=blocklist,
@@ -790,22 +832,86 @@ def check_jobs(jobs_folder, details, resubmit, max_resubmit, queue_shift, ncpu, 
         if result["failed"]:
             raise click.exceptions.Exit(1)
         if not resubmit:
+            advance_startup_step()
             return
         folder, _, submission, state, state_file = load_current_contract(folder)
+    else:
+        show_startup_step("Other startup steps")
+    advance_startup_step()
 
     total = [f"job_{job}" for job in state]
     groups = None
     label = None
     overlap = False
     if group_by != "none":
+        show_startup_step("Loading progress groups")
         sample_jobs, dataset_jobs = load_job_to_group_map(folder)
         groups, label = (sample_jobs, "sample") if group_by == "sample" else (dataset_jobs, "dataset")
         if groups:
             listed = [job for jobs in groups.values() for job in jobs]
             overlap = len(listed) != len(set(listed))
+        advance_startup_step()
+    else:
+        show_startup_step("Other startup steps")
+        advance_startup_step()
+    offsets = {}
+    show_startup_step("Scanning job status")
+    findings = scan_condor_log_failures(folder, offsets)
+    idle, running, done, failed, timeout = check_jobs_logs(folder)
+    advance_startup_step()
+    log_text, pending, definitive = [], {}, set()
+
+    mutation = bool(resubmit or recreate is not None)
+
+    def prepare_status(idle, running, done, failed, timeout, findings):
+        if mutation:
+            apply_condor_log_failures(folder, findings)
+            idle, running, done, failed, timeout = check_jobs_logs(folder)
+            convert_timeout_jobs(folder, timeout, running, idle, failed, queue_shift, ncpu,
+                                 state, log_text, pending)
+        else:
+            idle, running, done, failed, timeout = merge_inferred_status(
+                idle, running, done, failed, timeout, findings)
+        resubmit_now = []
+        if resubmit:
+            for job in failed:
+                if job in definitive:
+                    continue
+                number = job.split("_", 1)[1]
+                attempts = int(state[number]["resubmissions"])
+                output = latest_job_out(folder, job)
+                out_text = Path(output).read_text(errors="replace") if output else ""
+                if "Corrupt input data" in out_text:
+                    log_text.append(f"{job} reported corrupt input data in its .out log.")
+                if attempts >= max_resubmit:
+                    definitive.add(job)
+                    continue
+                if (attempts >= 1 and job not in timeout and job not in pending
+                        and not is_xrootd_exhaustion_log(out_text)):
+                    pending[job] = candidate_state(
+                        state[number], submission["executor"], queue_shift, ncpu)
+                resubmit_now.append(number)
+        if resubmit_now:
+            successful = submit_resubmit_jobs(folder, resubmit_now, state, state_file, log_text, pending)
+            for number in successful:
+                job = f"job_{number}"
+                failed[:] = [value for value in failed if value != job]
+                if job not in idle:
+                    idle.append(job)
+                pending.pop(job, None)
+                definitive.discard(job)
+        return idle, running, done, failed, timeout
+
+    if resubmit:
+        show_startup_step("Preparing resubmissions")
+    idle, running, done, failed, timeout = prepare_status(
+        idle, running, done, failed, timeout, findings)
+    if resubmit:
+        advance_startup_step()
+    if startup_progress is not None:
+        startup_progress.stop()
 
     layout = create_layout(with_progress=groups is not None)
-    log_text, offsets, pending, definitive = [], {}, {}, set()
 
     def refresh(idle, running, done, failed, timeout):
         summary, _ = get_tables(total, idle, running, done, failed, timeout, details)
@@ -817,48 +923,17 @@ def check_jobs(jobs_folder, details, resubmit, max_resubmit, queue_shift, ncpu, 
                 get_progress_table(aggregate_by_group(groups, idle, running, done, failed), label, overlap)))
         layout["right"].update(Panel("\n".join(log_text[-20:]) or "No logs yet", title="Log"))
 
-    mutation = bool(resubmit or recreate is not None)
+    refresh(idle, running, done, failed, timeout)
     with Live(layout, refresh_per_second=0.2, console=Console()):
+        first_pass = True
         while True:
-            findings = scan_condor_log_failures(folder, offsets)
-            idle, running, done, failed, timeout = check_jobs_logs(folder)
-            if mutation:
-                apply_condor_log_failures(folder, findings)
+            if not first_pass:
+                findings = scan_condor_log_failures(folder, offsets)
                 idle, running, done, failed, timeout = check_jobs_logs(folder)
-                convert_timeout_jobs(folder, timeout, running, idle, failed, queue_shift, ncpu,
-                                     state, log_text, pending)
-            else:
-                idle, running, done, failed, timeout = merge_inferred_status(
+                idle, running, done, failed, timeout = prepare_status(
                     idle, running, done, failed, timeout, findings)
-            resubmit_now = []
-            if resubmit:
-                for job in failed:
-                    if job in definitive:
-                        continue
-                    number = job.split("_", 1)[1]
-                    attempts = int(state[number]["resubmissions"])
-                    output = latest_job_out(folder, job)
-                    out_text = Path(output).read_text(errors="replace") if output else ""
-                    if "Corrupt input data" in out_text:
-                        log_text.append(f"{job} reported corrupt input data in its .out log.")
-                    if attempts >= max_resubmit:
-                        definitive.add(job)
-                        continue
-                    if (attempts >= 1 and job not in timeout and job not in pending
-                            and not is_xrootd_exhaustion_log(out_text)):
-                        pending[job] = candidate_state(
-                            state[number], submission["executor"], queue_shift, ncpu)
-                    resubmit_now.append(number)
-            if resubmit_now:
-                successful = submit_resubmit_jobs(folder, resubmit_now, state, state_file, log_text, pending)
-                for number in successful:
-                    job = f"job_{number}"
-                    failed[:] = [value for value in failed if value != job]
-                    if job not in idle:
-                        idle.append(job)
-                    pending.pop(job, None)
-                    definitive.discard(job)
-            refresh(idle, running, done, failed, timeout)
+                refresh(idle, running, done, failed, timeout)
+            first_pass = False
             terminal_failed = len(definitive) if resubmit else len(failed)
             if len(total) == len(done) + terminal_failed:
                 rprint("[green]All jobs are completed[/]")
